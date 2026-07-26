@@ -1,0 +1,22 @@
+{
+  "id": "mcp-tmpl-server-header-fingerprint",
+  "protocol": "mcp",
+  "info": {
+    "title": "Server response header discloses framework/version detail",
+    "severity": "info",
+    "asi_refs": ["ASI09"],
+    "description": "The response includes a Server or X-Powered-By header identifying the underlying framework. Not a vulnerability by itself, but useful fingerprinting context and worth trimming in production.",
+    "remediation": "Suppress or genericize framework-identifying response headers in production deployments.",
+    "tags": ["fingerprint", "information-disclosure"],
+    "author": "agentrecon-core"
+  },
+  "request": {
+    "method": "tools/list",
+    "params": {}
+  },
+  "match_logic": "any",
+  "matchers": [
+    { "type": "header", "header": "Server" },
+    { "type": "header", "header": "X-Powered-By" }
+  ]
+}

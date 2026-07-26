@@ -86,7 +86,7 @@ If `--out` is provided, file output is written in addition to stdout.
 Build from source with Go:
 
 ```bash
-go install github.com/youruser/reap/cmd/reap@latest
+go install github.com/hackwither/reap/cmd/reap@latest
 ```
 
 Or build locally:

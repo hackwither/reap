@@ -1,0 +1,22 @@
+{
+  "id": "mcp-tmpl-high-risk-tool-names",
+  "protocol": "mcp",
+  "info": {
+    "title": "Tool list includes names suggesting code execution or filesystem access",
+    "severity": "medium",
+    "asi_refs": ["ASI02", "ASI07"],
+    "description": "The tool list (requested with credentials, if any were supplied) includes a tool name matching patterns associated with code-execution or raw-filesystem primitives. This is a triage signal for closer review; verify the tool's actual capabilities and authorization model.",
+    "remediation": "Review tool capabilities in context. If the tool performs code execution or unrestricted filesystem access, scope it behind explicit, auditable authorization separate from general tool listing. Consider narrower alternatives.",
+    "tags": ["tool-misuse", "excessive-agency"],
+    "author": "agentrecon-core"
+  },
+  "request": {
+    "method": "tools/list",
+    "params": {},
+    "no_auth": false
+  },
+  "match_logic": "any",
+  "matchers": [
+    { "type": "json_path", "path": "result.tools.*.name", "any_of": ["exec_shell", "run_command", "os_system", "fs_write", "spawn", "system_call", "execute_command", "shell_exec", "popen", "eval", "python_exec", "bash_exec", "read_file", "write_file"], "value_contains": true }
+  ]
+}
