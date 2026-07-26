@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+/bin/
+*.out
+report.json
+.plans/
+README_old.md
