@@ -1,6 +1,6 @@
 # REAP
 
-**Reconnaissance and Enumeration for Agent Protocols**
+### **Reconnaissance and Enumeration for Agent Protocols**
 
 `reap` is active reconnaissance for AI agent endpoints. It probes protocol surface and auth posture, and surfaces findings without invoking any discovered tool.
 
