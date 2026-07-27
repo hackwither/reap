@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/github/go-mod/go-version/hackwither/reap" alt="Go version">
   <img src="https://img.shields.io/github/license/hackwither/reap" alt="License">
-  <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release">
+ <!-- <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release"> -->
 </p>
 
 **REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL you're authorized to test and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
