@@ -1,181 +1,167 @@
-# REAP
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="REAP logo" width="160">
+  </picture>
+</p>
 
-### **Reconnaissance and Enumeration for Agent Protocols**
+<h1 align="center">REAP</h1>
+<p align="center"><strong>Reconnaissance and Enumeration for Agent Protocols</strong></p>
 
-`reap` is active reconnaissance for AI agent endpoints. It probes protocol surface and auth posture, and surfaces findings without invoking any discovered tool.
+<p align="center">
+  <img src="https://img.shields.io/github/go-mod/go-version/hackwither/reap" alt="Go version">
+  <img src="https://img.shields.io/github/license/hackwither/reap" alt="License">
+  <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release">
+</p>
 
->  **Use only against systems you own or are explicitly authorized to test.**
-> `reap` can run without `--authorized`, but you should only do so when you have permission to test the target. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
+**REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL you're authorized to test and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
 
-## Why REAP
+> **Use only against systems you own or are explicitly authorized to test.** REAP runs without `--authorized`, but you should only do that when you have permission. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
 
-Agent protocols are being deployed faster than the tooling to audit them. An MCP server can leak its full tool inventory to anonymous callers, advertise permissive CORS, or expose a dynamic-dispatch tool that hides a much larger capability surface than `tools/list` reports, and today there's no standard way to check for any of it before something goes live.
+## Why REAP exists
 
-`reap` exists to close that gap: a single, purpose-built recon tool for the agent-protocol layer, with a hard architectural boundary against ever touching what it finds.
+The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty program just put in scope. The internal service someone stood up behind a load balancer with `allowedOrigins: ["*"]` and forgot about. That's what REAP does: external, unauthenticated, black-box recon against a live agent endpoint, from the position an actual attacker occupies.
 
-## What this project is
+## What makes it different
 
-`reap` is designed as a reconnaissance tool for agent protocols, with an initial focus on MCP (Model Context Protocol) over streamable HTTP.
+**It reads, it never invokes** This is enforced architecturally, not by convention. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool. There is no code path in REAP that sends `tools/call`, on any transport, from any built-in probe or user-supplied template. A scanner that executes what it finds on an agent endpoint isn't a scanner, it's an agent. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
 
-It is intentionally not:
+**It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS. REAP checks the things that only make sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to.
 
-- an internet-wide scanner
-- a tool that invokes discovered agent capabilities
-- a static analysis tool that needs target source code
+**It's built for pipelines and CI** Text for humans, NDJSON for pipelines, SARIF 2.1.0 for GitHub Advanced Security and every other code-scanning ingestion point. Single static Go binary, zero third-party dependencies, no API key, no telemetry, nothing leaves your machine except the requests you asked for.
 
-## Use cases
+**It's designed to outlive MCP** MCP is the only supported protocol today, and it's the right first target. But the architecture (a protocol registry, per-protocol sessions, declarative checks) assumes there will be others.
 
-`reap` is useful for:
+## Install
 
-- detecting overly-permissive CORS headers on agent gateways
-- finding plaintext HTTP transport exposure
-- auditing whether handshake instructions leak sensitive prompt material
-- discovering dynamic-dispatch patterns where the true capability surface may be larger than `tools/list`
-- integrating agent protocol reconnaissance into security reviews and CI workflows
-
-## Supported protocol
-
-- `mcp`: the Model Context Protocol over HTTP
-
-The codebase is architected so new protocols can be added later, but MCP is the only supported protocol today. As agent protocols proliferate, REAP is designed to grow into the protocol-agnostic recon layer for all of them.
-
-## Built-in MCP checks
-
-The built-in MCP probe suite includes the following checks:
-| Check Name | Description |
-|---|---|
-| `mcp-unauth-tools-list` | Detects whether `tools/list` is accessible to unauthenticated callers. |
-| `mcp-tool-capability-surface` | Enumerates the full reported tool inventory for asset discovery and diffing. |
-| `mcp-cors-wildcard` | Flags permissive wildcard CORS policies and credentialed cross-origin access. |
-| `mcp-plaintext-transport` | Detects MCP endpoints served over plaintext HTTP instead of HTTPS. |
-| `mcp-tls-cert-health` | Checks TLS certificate validity, hostname matching, and weak protocol/cipher posture. |
-| `mcp-host-header-validation` | Verifies the server validates the Host header during MCP initialize requests. |
-| `mcp-rate-limit-absence` | Reports missing standard rate-limit headers on successful MCP responses. |
-| `mcp-transport-downgrade` | Detects the same host accepting MCP-style traffic over plaintext HTTP. |
-| `mcp-oauth-metadata-posture` | Inspects OAuth metadata endpoints for Bearer challenge and PKCE advertising. |
-| `mcp-redirect-uri-laxity` | Identifies overly broad or wildcard OAuth redirect URI registration. |
-| `mcp-session-id-entropy` | Checks MCP session ID entropy for weak or predictable identifiers. |
-| `mcp-instructions-exposure` | Flags lengthy or sensitive-feeling initialize instructions returned during handshake. |
-| `mcp-resources-prompts-exposure` | Detects unauthenticated access to `resources/list` and `prompts/list`. |
-| `mcp-dynamic-dispatch` | Detects dynamic dispatch/search tool patterns that imply a hidden or incomplete capability surface. |
-
-## How it works
-
-### CLI flow
-
-1. Parse flags and load templates from `templates/` by default
-2. Validate authorization via `--authorized`
-3. Collect targets from `-t`, `--targets-file`, or stdin
-4. For each target:
-   - create an MCP session
-   - perform `initialize`
-   - run all probes for the requested protocol
-   - build a `report.Report`
-5. Render output as text, JSON, or SARIF
-
-### Output modes
-
-- `text` : human-readable report
-- `json` : machine-readable JSON report (`NDJSON` for batch mode)
-- `sarif` : SARIF 2.1.0 report for CI/security tooling
-
-If `--out` is provided, file output is written in addition to stdout.
-
-## Installation
-
-Build from source with Go:
-
-```bash
+```sh
 go install github.com/hackwither/reap/cmd/reap@latest
 ```
 
-Or build locally:
+Or build from source:
 
-```bash
-go build -o bin/reap ./cmd/reap
+```sh
+git clone https://github.com/hackwither/reap
+cd reap && go build -o bin/reap ./cmd/reap
 ```
 
-## Basic usage
+Requires Go 1.21+. No other dependencies.
 
-```bash
+## Quick start
+
+Scan a single endpoint:
+
+```sh
+reap -t https://your-host/mcp --authorized
+```
+
+With credentials, to see what an authenticated caller gets:
+
+```sh
 reap -t https://your-host/mcp --auth-header "Bearer $TOKEN" --authorized
 ```
 
-Machine readable output:
+Machine-readable, written to a file:
 
-```bash
+```sh
 reap -t https://your-host/mcp --authorized --output json --out results/report.json
 ```
 
-List available probes:
+A whole scope list, concurrently, as NDJSON:
 
-```bash
-reap --list-probes
+```sh
+cat scope.txt | reap --authorized --output json --concurrency 10
 ```
 
-Batch mode example:
+In CI, as SARIF:
 
-```bash
-cat targets.txt | reap --authorized --output json
+```sh
+reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif
 ```
 
-## CLI flags
-
-- `-t`, `--target` : target MCP endpoint URL
-- `--targets-file` : file containing one target URL per line
-- `--protocol` : protocol to probe (`mcp`)
-- `--auth-header` : optional Authorization header value
-- `--timeout` : per-request timeout (default `10s`)
-- `--templates` : directory of JSON probe templates (default `templates`)
-- `-v`, `--verbose` : enable verbose scan progress output
-- `--output` : output format: `text`, `json`, `sarif`
-- `--out` : write report to file in addition to stdout
-- `--include` : comma-separated probe IDs to run
-- `--exclude` : comma-separated probe IDs to skip
-- `--list-probes` : list all registered probes and exit
-- `--authorized` : assert you are authorized to test the target(s)
-- `--concurrency` : number of concurrent target scans in batch mode
-
-## Templates and extensibility
-
-`reap` supports declarative JSON probe templates in `templates/`.
-
-A template can:
-
-- send a single request to the target protocol
-- inspect HTTP headers, status code, response body, and JSON payload
-- run `status_code`, `header`, `body_contains`, and `json_path` matchers
-- be enabled or disabled via `--include` / `--exclude`
-
-### Limitations
-
-A template cannot:
-
-- chain multiple requests
-- branch based on response data
-- invoke discovered tools or side-effecting actions
-
-If your check needs more logic than this, write a Go probe in `internal/probe/<protocol>/checks.go`.
-
-
-## Development
-
-Run the unit tests:
-
-```bash
-go test ./...
+```yaml
+# .github/workflows/agent-recon.yml
+- name: Upload REAP findings
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: reap.sarif
 ```
 
-Build a local executable:
+## What it checks
 
-```bash
-go build -o bin/reap ./cmd/reap
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10).
+
+### Capability surface: what is this endpoint willing to tell a stranger?
+
+| Check | What it finds |
+|---|---|
+| `mcp-unauth-tools-list` | `tools/list` answering to unauthenticated callers |
+| `mcp-tool-capability-surface` | Full reported tool inventory, for asset tracking and cross-run diffing |
+| `mcp-resources-prompts-exposure` | Unauthenticated `resources/list` and `prompts/list` |
+| `mcp-dynamic-dispatch` | Dispatch/search tool patterns implying a hidden capability surface larger than `tools/list` reports |
+| `mcp-instructions-exposure` | Handshake `instructions` leaking operator prompt material |
+
+### Auth and session posture
+
+| Check | What it finds |
+|---|---|
+| `mcp-oauth-metadata-posture` | OAuth metadata endpoints missing Bearer challenge or PKCE advertisement |
+| `mcp-redirect-uri-laxity` | Overly broad or wildcard OAuth redirect URI registration |
+| `mcp-session-id-entropy` | Weak or predictable session identifiers |
+| `mcp-host-header-validation` | Servers not validating `Host` during `initialize` |
+
+### Transport posture
+
+| Check | What it finds |
+|---|---|
+| `mcp-plaintext-transport` | Endpoints served over plaintext HTTP |
+| `mcp-transport-downgrade` | The same host also accepting MCP traffic in the clear |
+| `mcp-tls-cert-health` | Certificate validity, hostname mismatch, weak protocol and cipher selection |
+| `mcp-cors-wildcard` | Wildcard CORS, and wildcard combined with credentialed cross-origin access |
+| `mcp-rate-limit-absence` | Missing standard rate-limit headers on successful responses |
+
+`reap --list-probes` prints the live set. Select with `--include` / `--exclude`.
+
+## Writing your own checks
+
+Drop a JSON template in `templates/`, no Go, no rebuild:
+
+```json
+{
+  "id": "mcp-custom-header-leak",
+  "protocol": "mcp",
+  "severity": "medium",
+  "request": { "method": "tools/list" },
+  "matchers": {
+    "condition": "all",
+    "rules": [
+      { "type": "status_code", "values": [200] },
+      { "type": "header", "name": "X-Internal-Service", "present": true }
+    ]
+  }
+}
 ```
 
-## Safety notice
+Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` / `all`.
 
-`reap` is a reconnaissance-only tool. It is explicitly designed to avoid destructive or exploitation behavior. Review the safety boundary in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before adding new protocol support.
+A template deliberately **cannot** chain requests, branch on response data, or invoke a discovered tool. The first two are a roadmap item. The third never will be. If your check needs real logic, write a Go probe in `internal/probe/<protocol>/checks.go`, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Roadmap
+
+Planned, not yet shipped:
+
+- **Additional transports**: legacy HTTP+SSE, stdio, WebSocket, behind the same `Session` interface and the same no-invoke boundary.
+- **Bounded range discovery**: sweep an operator-supplied host and port list for agent endpoints.
+- **More protocols**: A2A, and whatever else reaches deployment scale.
+
+Issues and PRs welcome on any of these.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). The one non-negotiable: nothing merged into REAP invokes a discovered capability. Every new protocol, transport, probe, and template is held to that boundary, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how it's enforced in the type system rather than by review.
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
+
+Built by [@hackwither](https://github.com/hackwither).
