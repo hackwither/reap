@@ -63,7 +63,7 @@ If your check genuinely needs one of these, it's not a template — write a Go p
 ## Testing your template
 
 ```bash
-agentrecon -t https://your-test-target/mcp --authorized --include mcp-tmpl-my-check --output json
+reap -t https://your-test-target/mcp --authorized --include mcp-tmpl-my-check --output json
 ```
 
 `--include` restricts the run to just your probe ID so you can iterate quickly without waiting on the full suite.

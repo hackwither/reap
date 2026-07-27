@@ -27,4 +27,4 @@ go test ./...
 
 ## Reporting exposures you find while testing this project
 
-If you're testing agentrecon itself against a real MCP server and it surfaces something concerning, that's a finding about *their* system, not ours — see the disclosure norms in [`SECURITY.md`](SECURITY.md). Please don't paste live, unredacted findings from third-party systems into GitHub issues here.
+If you're testing reap itself against a real MCP server and it surfaces something concerning, that's a finding about *their* system, not ours — see the disclosure norms in [`SECURITY.md`](SECURITY.md). Please don't paste live, unredacted findings from third-party systems into GitHub issues here.

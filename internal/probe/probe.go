@@ -1,4 +1,4 @@
-// Package probe defines the plugin contract for agentrecon.
+// Package probe defines the plugin contract for reap.
 //
 // A Probe is one self-contained check: "connect, ask one question, record
 // what came back." Probes never chain destructive actions and never invoke
@@ -14,7 +14,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hackwither/agentrecon/internal/report"
+	"github.com/hackwither/reap/internal/report"
 )
 
 // Session is the sandboxed handle a Probe gets. It deliberately does NOT

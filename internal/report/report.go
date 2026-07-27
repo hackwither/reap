@@ -48,6 +48,12 @@ type Target struct {
 	ServerName  string `json:"server_name,omitempty"`
 	ServerVer   string `json:"server_version,omitempty"`
 	ProtocolVer string `json:"protocol_version,omitempty"`
+
+	// Populated only when the target was resolved via Discovery
+	// (--protocol auto) rather than assumed from a flag.
+	Transport           string `json:"transport,omitempty"`
+	DiscoveryMethod      string `json:"discovery_method,omitempty"`      // detector ID, or "manual"
+	DiscoveryConfidence  string `json:"discovery_confidence,omitempty"`  // "high"/"medium"/"low"
 }
 
 // Report is the full output of a scan run.
@@ -96,7 +102,7 @@ func (r *Report) WriteHuman(w io.Writer) {
 		return severityRank[r.Findings[i].Severity] > severityRank[r.Findings[j].Severity]
 	})
 
-	fmt.Fprintf(w, "\nagentrecon report — target: %s\n", r.Target.URL)
+	fmt.Fprintf(w, "\nreap report — target: %s\n", r.Target.URL)
 	if r.Target.ServerName != "" {
 		fmt.Fprintf(w, "  server:   %s %s\n", r.Target.ServerName, r.Target.ServerVer)
 	}
@@ -231,8 +237,8 @@ func (r *Report) WriteSARIF(w io.Writer) error {
 			{
 				"tool": map[string]any{
 					"driver": map[string]any{
-						"name":           "agentrecon",
-						"informationUri": "https://github.com/hackwither/agentrecon",
+						"name":           "reap",
+						"informationUri": "https://github.com/hackwither/reap",
 						"version":        r.Version,
 						"rules":          rules,
 					},
@@ -260,7 +266,7 @@ func uniqueFindingIDs(findings []Finding) []string {
 	return ids
 }
 
-// severityToSARIFLevel maps agentrecon severity to SARIF level
+// severityToSARIFLevel maps reap severity to SARIF level
 func severityToSARIFLevel(sev Severity) string {
 	switch sev {
 	case SeverityHigh:

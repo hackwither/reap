@@ -42,7 +42,7 @@ type Session interface {
 }
 ```
 
-There is no `InvokeTool(name, args)` method anywhere in this interface, and there never should be. A probe (Go or JSON template) can ask "what tools exist" but cannot call one. This is what keeps `agentrecon` a reconnaissance tool rather than turning into an exploitation framework as protocol coverage grows, the constraint is structural, not a linting rule someone can forget.
+There is no `InvokeTool(name, args)` method anywhere in this interface, and there never should be. A probe (Go or JSON template) can ask "what tools exist" but cannot call one. This is what keeps `reap` a reconnaissance tool rather than turning into an exploitation framework as protocol coverage grows, the constraint is structural, not a linting rule someone can forget.
 
 If a future contribution genuinely needs to distinguish "tool exists" from "tool is actually callable" (a real and useful distinction), the right design is a narrowly-scoped `DryRunCapabilityCheck` that validates a tool's declared JSON schema without invoking it — not a general invoke path. Open an issue before building this so we can agree on the boundary.
 

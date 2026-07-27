@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hackwither/agentrecon/internal/probe"
-	"github.com/hackwither/agentrecon/internal/probe/common"
-	"github.com/hackwither/agentrecon/internal/report"
+	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/probe/common"
+	"github.com/hackwither/reap/internal/report"
 )
 
 // All built-in probes registered by this package.
@@ -42,7 +42,7 @@ func initializeParams() map[string]any {
 		"protocolVersion": mcpProtocolVersion,
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]any{
-			"name":    "agentrecon",
+			"name":    "reap",
 			"version": "0.1.0",
 		},
 	}
@@ -731,7 +731,7 @@ func (p *corsWildcardProbe) ID() string       { return "mcp-cors-wildcard" }
 func (p *corsWildcardProbe) Protocol() string { return "mcp" }
 
 func (p *corsWildcardProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithHeader("Origin", "https://agentrecon-cors-probe.invalid"))
+	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithHeader("Origin", "https://reap-cors-probe.invalid"))
 	if err != nil {
 		return nil
 	}

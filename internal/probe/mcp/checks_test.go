@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/hackwither/agentrecon/internal/probe"
-	"github.com/hackwither/agentrecon/internal/report"
+	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/report"
 )
 
 type fakeSession struct {
@@ -142,7 +142,7 @@ func TestDynamicDispatchProbe(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
+			rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
 			testProbe := &dynamicDispatchProbe{}
 			if err := testProbe.Run(context.Background(), newFakeSession(map[string]*probe.RawResult{"tools/list": &probe.RawResult{StatusCode: 200, Body: tc.fixture, Headers: http.Header{}}}), rep); err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -194,7 +194,7 @@ func TestDynamicDispatchProbe(t *testing.T) {
 }
 
 func TestHostHeaderValidationProbe(t *testing.T) {
-	rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
+	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
 	sess := newFakeSession(map[string]*probe.RawResult{
 		"initialize": {
 			StatusCode: 200,
@@ -215,7 +215,7 @@ func TestHostHeaderValidationProbe(t *testing.T) {
 }
 
 func TestRateLimitAbsenceProbe(t *testing.T) {
-	rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
+	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
 	sess := newFakeSession(map[string]*probe.RawResult{
 		"tools/list": {
 			StatusCode: 200,
@@ -238,7 +238,7 @@ func TestRateLimitAbsenceProbe(t *testing.T) {
 }
 
 func TestSessionIDEntropyProbe(t *testing.T) {
-	rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
+	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: "https://example.com/mcp", Protocol: "mcp"}}
 	probe := &sessionIDEntropyProbe{}
 	sess := &Session{sessionID: "1234567890"}
 	if err := probe.Run(context.Background(), sess, rep); err != nil {
@@ -261,7 +261,7 @@ func TestOAuthMetadataPostureProbe(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: srv.URL, Protocol: "mcp"}}
+	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: srv.URL, Protocol: "mcp"}}
 	probe := &oauthMetadataPostureProbe{}
 	if err := probe.Run(context.Background(), &Session{url: srv.URL}, rep); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -277,7 +277,7 @@ func TestTlsCertHealthProbe(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	rep := &report.Report{Tool: "agentrecon", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: ts.URL, Protocol: "mcp"}}
+	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: ts.URL, Protocol: "mcp"}}
 	probe := &tlsCertHealthProbe{}
 	if err := probe.Run(context.Background(), &Session{url: ts.URL}, rep); err != nil {
 		t.Fatalf("unexpected error: %v", err)

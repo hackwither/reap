@@ -1,0 +1,16 @@
+{
+  "id": "mcp-http-sse-legacy",
+  "protocol": "mcp",
+  "transport": "http-sse-legacy",
+  "kinds": ["url", "host-port"],
+  "request": {
+    "http_method": "GET",
+    "headers": { "Accept": "text/event-stream" }
+  },
+  "matchers": [
+    { "type": "header", "header": "Content-Type", "contains": "text/event-stream" },
+    { "type": "body_contains", "any_of": ["event: endpoint", "event:endpoint"] }
+  ],
+  "match_logic": "all",
+  "on_match_confidence": "medium"
+}

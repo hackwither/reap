@@ -3,7 +3,7 @@ package template
 import (
 	"testing"
 
-	"github.com/hackwither/agentrecon/internal/probe"
+	"github.com/hackwither/reap/internal/probe"
 )
 
 func TestResolvePath(t *testing.T) {

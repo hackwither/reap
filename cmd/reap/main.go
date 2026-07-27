@@ -1,4 +1,4 @@
-// Command agentrecon is a single-target, active reconnaissance tool for AI
+// Command reap is a single-target, active reconnaissance tool for AI
 // agent endpoints — think nmap/whatweb for MCP (and, as protocol coverage
 // grows, A2A and other agent-facing protocols), rather than an internet-wide
 // scanner. See README.md for the ethics/authorization requirements before
@@ -8,7 +8,7 @@ package main
 import (
 	"os"
 
-	"github.com/hackwither/agentrecon/internal/cli"
+	"github.com/hackwither/reap/internal/cli"
 )
 
 func main() {

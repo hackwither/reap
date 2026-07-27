@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal mock MCP (streamable HTTP) server for testing agentrecon end-to-end.
+"""Minimal mock MCP (streamable HTTP) server for testing reap end-to-end.
 Deliberately insecure (no auth, wildcard CORS, exec-sounding tool) to exercise every built-in probe."""
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer

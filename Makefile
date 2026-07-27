@@ -1,7 +1,7 @@
 .PHONY: build vet fmt test check run-list
 
 build:
-	go build -o bin/agentrecon ./cmd/agentrecon
+	go build -o bin/reap ./cmd/reap
 
 fmt:
 	gofmt -w .
@@ -15,4 +15,4 @@ test:
 check: fmt vet build test
 
 run-list: build
-	./bin/agentrecon --list-probes
+	./bin/reap --list-probes

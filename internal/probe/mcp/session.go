@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hackwither/agentrecon/internal/probe"
+	"github.com/hackwither/reap/internal/probe"
 )
 
 const mcpProtocolVersion = "2025-06-18" // most recent MCP spec version at write time; server may negotiate down
@@ -167,7 +167,7 @@ func (s *Session) Initialize(ctx context.Context) (*InitializeResult, *probe.Raw
 		"protocolVersion": mcpProtocolVersion,
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]any{
-			"name":    "agentrecon",
+			"name":    "reap",
 			"version": "0.1.0",
 		},
 	}
@@ -205,6 +205,18 @@ func rpcErrorMessage(raw json.RawMessage) string {
 		return s
 	}
 	return string(raw)
+}
+
+// ProbeInitialize performs a standalone MCP initialize handshake against url,
+// without requiring a caller to construct and hold a Session. This exists so
+// internal/discovery can reuse the exact JSON-RPC envelope and SSE-normalization
+// logic Session already implements, rather than duplicating it, while keeping
+// the dependency direction one-way (discovery depends on probe/mcp, not the
+// other way around).
+func ProbeInitialize(ctx context.Context, url, authHeader string, timeout time.Duration) (*InitializeResult, error) {
+	s := NewSession(url, authHeader, timeout)
+	init, _, err := s.Initialize(ctx)
+	return init, err
 }
 
 type InitializeResult struct {

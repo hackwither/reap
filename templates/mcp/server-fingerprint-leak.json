@@ -8,7 +8,7 @@
     "description": "The response includes a Server or X-Powered-By header identifying the underlying framework. Not a vulnerability by itself, but useful fingerprinting context and worth trimming in production.",
     "remediation": "Suppress or genericize framework-identifying response headers in production deployments.",
     "tags": ["fingerprint", "information-disclosure"],
-    "author": "agentrecon-core"
+    "author": "reap-core"
   },
   "request": {
     "method": "tools/list",

@@ -16,14 +16,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hackwither/agentrecon/internal/probe"
-	"github.com/hackwither/agentrecon/internal/probe/mcp"
-	"github.com/hackwither/agentrecon/internal/report"
-	"github.com/hackwither/agentrecon/internal/template"
+	"github.com/hackwither/reap/internal/discovery"
+	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/probe/mcp"
+	"github.com/hackwither/reap/internal/report"
+	"github.com/hackwither/reap/internal/template"
 )
 
 const banner = `
-agentrecon — single-target active reconnaissance for AI agent endpoints (MCP, and growing)
+REAP: active reconnaissance for AI agent endpoints (MCP, and growing)
 
 This tool sends real requests to the target and only performs read-only
 protocol operations (handshake, capability/tool listing, header
@@ -33,8 +34,7 @@ exploitation.
 USE ONLY AGAINST SYSTEMS YOU OWN OR ARE EXPLICITLY AUTHORIZED TO TEST.
 Unauthorized access to computer systems is illegal in most jurisdictions
 (e.g. the US Computer Fraud and Abuse Act) even when the requests
-themselves are "just" reads. Running this tool is your representation that
-you have that authorization.
+themselves are "just" reads. happy (ethical) hacking!
 `
 
 // collectTargets gathers targets from -t flag, --targets-file, and stdin.
@@ -91,21 +91,26 @@ func collectTargets(opts *Options, stderr *os.File) ([]string, error) {
 }
 
 type Options struct {
-	Target       string
-	TargetsFile  string
-	Protocol     string
-	AuthHeader   string
-	Timeout      time.Duration
-	TemplatesDir string
-	Output       string
-	OutFile      string
-	Include      string
-	Exclude      string
-	ListProbes   bool
-	Authorized   bool
-	Concurrency  int
-	Verbose      bool
-	Logger       *log.Logger
+	Target          string
+	TargetsFile     string
+	Protocol        string
+	Mode            string
+	NoBanner        bool
+	VersionFlag     bool
+	ListDetectors   bool
+	AuthHeader      string
+	Timeout         time.Duration
+	TemplatesDir    string
+	FingerprintsDir string
+	Output          string
+	OutFile         string
+	Include         string
+	Exclude         string
+	ListProbes      bool
+	Authorized      bool
+	Concurrency     int
+	Verbose         bool
+	Logger          *log.Logger
 }
 
 func verboseLog(opts *Options, format string, args ...any) {
@@ -123,6 +128,13 @@ func Run(args []string, stdout, stderr *os.File) int {
 	}
 	if opts == nil { // -h/--help
 		return 0
+	}
+	if opts.VersionFlag {
+		fmt.Fprintf(stdout, "reap v%s\n", Version)
+		return 0
+	}
+	if !opts.NoBanner {
+		PrintBanner(stderr)
 	}
 	if opts.Verbose {
 		opts.Logger = log.New(stderr, "", 0)
@@ -150,6 +162,15 @@ func Run(args []string, stdout, stderr *os.File) int {
 		return 0
 	}
 
+	// discovery / detector listing
+	if opts.ListDetectors {
+		dreg := buildDiscoveryRegistry(opts, stderr)
+		for _, d := range dreg.All() {
+			fmt.Fprintf(stdout, "%-40s kinds=%v\n", d.ID(), d.Kinds())
+		}
+		return 0
+	}
+
 	// Collect targets from all sources
 	targets, err := collectTargets(opts, stderr)
 	if err != nil {
@@ -161,6 +182,23 @@ func Run(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintln(stderr, "error: must provide -t, --targets-file, or pipe targets via stdin")
 		fs.Usage()
 		return 2
+	}
+
+	if opts.Mode == "discover" {
+		dreg := buildDiscoveryRegistry(opts, stderr)
+
+		enc := json.NewEncoder(stdout)
+		for _, t := range targets {
+			c := classifyCandidate(t)
+			fp := discovery.Run(context.Background(), dreg, c, discovery.DetectOptions{Timeout: opts.Timeout, AuthHeader: opts.AuthHeader})
+			if fp == nil {
+				// print minimal object indicating no fingerprint
+				_ = enc.Encode(map[string]any{"input": t, "fingerprint": nil})
+			} else {
+				_ = enc.Encode(fp)
+			}
+		}
+		return 0
 	}
 
 	// Authorization assertion is optional; warn if absent.
@@ -177,12 +215,80 @@ func Run(args []string, stdout, stderr *os.File) int {
 	return scanBatch(targets, opts, reg, stdout, stderr)
 }
 
+// classifyCandidate applies the same "is this a full URL or a bare
+// host:port" heuristic --mode=discover and --protocol=auto both need before
+// they can build a discovery.Candidate.
+func classifyCandidate(target string) discovery.Candidate {
+	var c discovery.Candidate
+	c.RawInput = target
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		c.Kind = discovery.KindURL
+		c.URL = target
+	} else {
+		c.Kind = discovery.KindHostPort
+	}
+	return c
+}
+
+// resolveViaDiscovery runs Discovery against target when opts.Protocol ==
+// "auto", populating rep.Target's discovery-derived fields and returning the
+// resolved protocol to scan with. For any other --protocol value it's a
+// no-op passthrough. Falls back to "mcp" when discovery finds nothing,
+// since that's the only implemented protocol pipeline today.
+func resolveViaDiscovery(ctx context.Context, target string, opts *Options, rep *report.Report, stderr *os.File) string {
+	if opts.Protocol != "auto" {
+		return opts.Protocol
+	}
+	dreg := buildDiscoveryRegistry(opts, stderr)
+	fp := discovery.Run(ctx, dreg, classifyCandidate(target), discovery.DetectOptions{Timeout: opts.Timeout, AuthHeader: opts.AuthHeader})
+	if fp == nil {
+		rep.Target.DiscoveryMethod = "none"
+		verboseLog(opts, "discovery found nothing for %s, falling back to mcp", target)
+		return "mcp"
+	}
+	rep.Target.Protocol = fp.Protocol
+	rep.Target.Transport = fp.Transport
+	rep.Target.DiscoveryMethod = fp.DetectorID
+	rep.Target.DiscoveryConfidence = fp.Confidence
+	if fp.ServerName != "" {
+		rep.Target.ServerName = fp.ServerName
+	}
+	if fp.ServerVer != "" {
+		rep.Target.ServerVer = fp.ServerVer
+	}
+	if fp.ProtocolVer != "" {
+		rep.Target.ProtocolVer = fp.ProtocolVer
+	}
+	verboseLog(opts, "discovery resolved %s as protocol=%s transport=%s confidence=%s (detector=%s)", target, fp.Protocol, fp.Transport, fp.Confidence, fp.DetectorID)
+	return fp.Protocol
+}
+
+// buildDiscoveryRegistry assembles the discovery.Registry from hand-written
+// Go detectors plus any data-driven fingerprints found in opts.FingerprintsDir
+// — the same two-source pattern probe.Registry already uses for built-in
+// probes plus loaded templates.
+func buildDiscoveryRegistry(opts *Options, stderr *os.File) *discovery.Registry {
+	dreg := discovery.NewRegistry()
+	for _, d := range discovery.BuiltinDetectors() {
+		dreg.Register(d)
+	}
+	if opts.FingerprintsDir != "" {
+		fingerprints, loadErrs := discovery.LoadFingerprintDir(opts.FingerprintsDir)
+		for _, e := range loadErrs {
+			fmt.Fprintf(stderr, "[fingerprint load error] %v\n", e)
+		}
+		for _, fpt := range fingerprints {
+			dreg.Register(fpt.AsDetector())
+		}
+	}
+	return dreg
+}
+
 // scanSingleTarget handles a single target (backward compatible path)
 func scanSingleTarget(target string, opts *Options, reg *probe.Registry, stdout, stderr *os.File) int {
 	verboseLog(opts, "scanning %s", target)
-	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
 	rep := &report.Report{
-		Tool:      "agentrecon",
+		Tool:      "reap",
 		Version:   "0.1.0",
 		StartedAt: time.Now().UTC(),
 		Target:    report.Target{URL: target, Protocol: opts.Protocol},
@@ -190,6 +296,9 @@ func scanSingleTarget(target string, opts *Options, reg *probe.Registry, stdout,
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout*4)
 	defer cancel()
+
+	protocol := resolveViaDiscovery(ctx, target, opts, rep, stderr)
+	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
 
 	init, _, err := sess.Initialize(ctx)
 	if err != nil {
@@ -202,7 +311,7 @@ func scanSingleTarget(target string, opts *Options, reg *probe.Registry, stdout,
 		verboseLog(opts, "initialize handshake success: server=%s version=%s protocol=%s", init.ServerInfo.Name, init.ServerInfo.Version, init.ProtocolVersion)
 	}
 
-	probes := filterProbes(reg.ForProtocol(opts.Protocol), opts.Include, opts.Exclude)
+	probes := filterProbes(reg.ForProtocol(protocol), opts.Include, opts.Exclude)
 	verboseLog(opts, "running %d probes for %s", len(probes), target)
 	for _, p := range probes {
 		verboseLog(opts, "running probe %s", p.ID())
@@ -266,9 +375,8 @@ func scanBatch(targets []string, opts *Options, reg *probe.Registry, stdout, std
 // scanTarget scans a single target and returns its report
 func scanTarget(target string, opts *Options, reg *probe.Registry) *report.Report {
 	verboseLog(opts, "scanning %s", target)
-	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
 	rep := &report.Report{
-		Tool:      "agentrecon",
+		Tool:      "reap",
 		Version:   "0.1.0",
 		StartedAt: time.Now().UTC(),
 		Target:    report.Target{URL: target, Protocol: opts.Protocol},
@@ -276,6 +384,9 @@ func scanTarget(target string, opts *Options, reg *probe.Registry) *report.Repor
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout*4)
 	defer cancel()
+
+	protocol := resolveViaDiscovery(ctx, target, opts, rep, os.Stderr)
+	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
 
 	init, _, err := sess.Initialize(ctx)
 	if err != nil {
@@ -288,7 +399,7 @@ func scanTarget(target string, opts *Options, reg *probe.Registry) *report.Repor
 		verboseLog(opts, "initialize handshake success: server=%s version=%s protocol=%s", init.ServerInfo.Name, init.ServerInfo.Version, init.ProtocolVersion)
 	}
 
-	probes := filterProbes(reg.ForProtocol(opts.Protocol), opts.Include, opts.Exclude)
+	probes := filterProbes(reg.ForProtocol(protocol), opts.Include, opts.Exclude)
 	verboseLog(opts, "running %d probes for %s", len(probes), target)
 	for _, p := range probes {
 		verboseLog(opts, "running probe %s", p.ID())
@@ -412,8 +523,8 @@ func writeBatchSARIF(reports []*report.Report, w *os.File) error {
 		runs = append(runs, map[string]any{
 			"tool": map[string]any{
 				"driver": map[string]any{
-					"name":           "agentrecon",
-					"informationUri": "https://github.com/hackwither/agentrecon",
+					"name":           "reap",
+					"informationUri": "https://github.com/hackwither/reap",
 					"version":        rep.Version,
 					"rules":          rules,
 				},
@@ -446,7 +557,7 @@ func uniqueFindingIDsFromFindings(findings []report.Finding) []string {
 	return ids
 }
 
-// severityToSARIFLevel maps agentrecon severity to SARIF level
+// severityToSARIFLevel maps reap severity to SARIF level
 func severityToSARIFLevel(sev report.Severity) string {
 	switch sev {
 	case report.SeverityHigh:
@@ -459,7 +570,6 @@ func severityToSARIFLevel(sev report.Severity) string {
 		return "note"
 	}
 }
-
 
 func filterProbes(all []probe.Probe, include, exclude string) []probe.Probe {
 	inc := splitCSV(include)
@@ -546,16 +656,21 @@ func writeReport(rep *report.Report, opts *Options, stdout, stderr *os.File) int
 }
 
 func parseFlags(args []string) (*Options, *flag.FlagSet, error) {
-	fs := flag.NewFlagSet("agentrecon", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
 	o := &Options{}
 	fs.StringVar(&o.Target, "t", "", "target MCP endpoint URL (e.g. https://host/mcp)")
 	fs.StringVar(&o.Target, "target", "", "target MCP endpoint URL (e.g. https://host/mcp)")
 	fs.StringVar(&o.TargetsFile, "targets-file", "", "file with one target URL per line (optionally combined with -t and stdin)")
 	fs.IntVar(&o.Concurrency, "concurrency", 5, "number of concurrent target scans in batch mode")
-	fs.StringVar(&o.Protocol, "protocol", "mcp", "protocol to probe (currently: mcp)")
+	fs.StringVar(&o.Protocol, "protocol", "mcp", "protocol to probe (currently: mcp|auto)")
+	fs.StringVar(&o.Mode, "mode", "scan", "mode to run: scan|discover|full (discover prints fingerprints)")
+	fs.BoolVar(&o.NoBanner, "no-banner", false, "suppress startup banner on stderr")
+	fs.BoolVar(&o.VersionFlag, "version", false, "print version and exit")
+	fs.BoolVar(&o.ListDetectors, "list-detectors", false, "list discovery detectors and exit")
 	fs.StringVar(&o.AuthHeader, "auth-header", "", `optional Authorization header value to send, e.g. "Bearer xyz"`)
 	fs.DurationVar(&o.Timeout, "timeout", 10*time.Second, "per-request timeout")
 	fs.StringVar(&o.TemplatesDir, "templates", "templates", "directory of JSON probe templates (empty string to disable)")
+	fs.StringVar(&o.FingerprintsDir, "fingerprints", "fingerprints", "directory of JSON discovery fingerprints (empty string to disable)")
 	fs.StringVar(&o.Output, "output", "text", "output format: text|json|sarif (JSON is NDJSON in batch mode)")
 	fs.StringVar(&o.OutFile, "out", "", "write report to file in addition to stdout")
 	fs.BoolVar(&o.Verbose, "v", false, "verbose output")
@@ -566,10 +681,10 @@ func parseFlags(args []string) (*Options, *flag.FlagSet, error) {
 	fs.BoolVar(&o.Authorized, "authorized", false, "confirm you own or are explicitly authorized to test the target(s)")
 
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), banner)
-		fmt.Fprintln(fs.Output(), "usage: agentrecon -t <url> --authorized [flags]")
-		fmt.Fprintln(fs.Output(), "       agentrecon --targets-file <file> --authorized [flags]")
-		fmt.Fprintln(fs.Output(), "       cat targets.txt | agentrecon --authorized [flags]")
+		PrintBanner(fs.Output())
+		fmt.Fprintln(fs.Output(), "usage: reap -t <url> --authorized [flags]")
+		fmt.Fprintln(fs.Output(), "       reap --targets-file <file> --authorized [flags]")
+		fmt.Fprintln(fs.Output(), "       cat targets.txt | reap --authorized [flags]")
 		fs.PrintDefaults()
 	}
 

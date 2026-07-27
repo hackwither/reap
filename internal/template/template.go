@@ -1,4 +1,4 @@
-// Package template implements agentrecon's contribution format: a
+// Package template implements reap's contribution format: a
 // declarative, no-code way to add a new check.
 //
 // This is deliberately modeled on nuclei's YAML templates, but written as
@@ -24,8 +24,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hackwither/agentrecon/internal/probe"
-	"github.com/hackwither/agentrecon/internal/report"
+	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/report"
 )
 
 type Template struct {
@@ -169,6 +169,23 @@ func (p *templateProbe) Run(ctx context.Context, s probe.Session, r *report.Repo
 		Tags:        t.Info.Tags,
 	})
 	return nil
+}
+
+// EvalMatcher evaluates a single Matcher against a raw response, exported so
+// other packages (internal/discovery's data-driven fingerprints) can reuse
+// the exact same matcher vocabulary against responses gathered outside a
+// probe.Session, without duplicating this logic.
+func EvalMatcher(m Matcher, raw *probe.RawResult, decoded any) (bool, map[string]any) {
+	return evalMatcher(m, raw, decoded)
+}
+
+// ResolveJSONPath resolves a dotted json_path expression (the same syntax
+// json_path matchers use, including "*" wildcard segments) against a decoded
+// JSON value. Exported alongside EvalMatcher so callers that match on a path
+// can also extract the matched value(s) — e.g. a fingerprint confirming
+// "result.serverInfo.name" exists can pull out what it actually is.
+func ResolveJSONPath(decoded any, path string) []any {
+	return resolvePath(decoded, splitPath(path))
 }
 
 func evalMatcher(m Matcher, raw *probe.RawResult, decoded any) (bool, map[string]any) {

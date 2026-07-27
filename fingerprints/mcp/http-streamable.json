@@ -1,0 +1,26 @@
+{
+  "id": "mcp-http-streamable",
+  "protocol": "mcp",
+  "transport": "http-streamable",
+  "kinds": ["url", "host-port"],
+  "request": {
+    "http_method": "POST",
+    "rpc_method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": {},
+      "clientInfo": { "name": "reap", "version": "0.1.0" }
+    }
+  },
+  "matchers": [
+    { "type": "json_path", "path": "result.serverInfo.name", "min_count": 1 },
+    { "type": "json_path", "path": "result.protocolVersion", "min_count": 1 }
+  ],
+  "match_logic": "all",
+  "on_match_confidence": "high",
+  "extract": {
+    "server_name": "result.serverInfo.name",
+    "server_ver": "result.serverInfo.version",
+    "protocol_ver": "result.protocolVersion"
+  }
+}
