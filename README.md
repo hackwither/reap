@@ -34,11 +34,7 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 
 ## Install
 
-```sh
-go install github.com/hackwither/reap/cmd/reap@latest
-```
-
-Or build from source:
+Build from source:
 
 ```sh
 git clone https://github.com/hackwither/reap
