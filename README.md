@@ -28,7 +28,7 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 
 ## What makes it different
 
-**It reads, it never invokes** This is enforced architecturally, not by convention. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool. There is no code path in REAP that sends `tools/call`, on any transport, from any built-in probe or user-supplied template. A scanner that executes what it finds on an agent endpoint isn't a scanner, it's an agent. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
+**It reads, it never invokes** A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
 
 **It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS. REAP checks the things that only make sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to.
 
