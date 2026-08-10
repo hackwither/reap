@@ -16,7 +16,11 @@
 
 **REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL you're authorized to test and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
 
-> **Use only against systems you own or are explicitly authorized to test.** REAP runs without `--authorized`, but you should only do that when you have permission. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
+
+<img width="1080" height="600" alt="reap_video-6" src="https://github.com/user-attachments/assets/fe5cf8f2-c584-4476-9353-99eb50c619f9" />
+
+> **Use only against systems you own or are explicitly authorized to test.** Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
+
 
 ## Why REAP exists
 
