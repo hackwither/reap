@@ -38,6 +38,24 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 go install github.com/hackwither/reap/cmd/reap@latest
 ```
 
+Or pin a specific release:
+
+```sh
+go install github.com/hackwither/reap/cmd/reap@v0.1.0
+```
+
+Homebrew (macOS/Linux):
+
+```sh
+brew install --cask hackwither/tap/reap
+```
+
+Docker:
+
+```sh
+docker run --rm ghcr.io/hackwither/reap -t https://your-host/mcp --authorized
+```
+
 Or build from source:
 
 ```sh
@@ -45,7 +63,7 @@ git clone https://github.com/hackwither/reap
 cd reap && go build -o bin/reap ./cmd/reap
 ```
 
-Requires Go 1.21+. No other dependencies.
+Requires Go 1.22+. No other dependencies.
 
 ## Quick start
 
@@ -87,9 +105,30 @@ reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif
     sarif_file: reap.sarif
 ```
 
+## Discovery: "is there an agent here at all?"
+
+Point `-t` at a URL without knowing the protocol, and `--protocol auto` figures out whether — and how — it speaks MCP before running a single security check:
+
+```sh
+reap -t https://maybe-an-mcp-host.example --protocol auto --authorized
+```
+
+This is the fix for the single biggest trust-killer a recon tool can have: firing a stack of findings against a target that was never actually confirmed to speak the protocol being scanned (a plain web server returning `200`/HTML on every path looks a lot like a listener if nothing checks). Every finding carries a `confidence` ("high"/"medium"/"low"), and if the target never completes a real protocol handshake, `reap` says so loudly and caps every finding at `info`/low-confidence rather than reporting them at face value:
+
+```
+⚠ TARGET NOT CONFIRMED AS AGENT ENDPOINT
+  mcp initialize handshake failed: decode initialize response: invalid character '<'
+  looking for beginning of value. Findings below are LOW confidence and likely
+  reflect a generic web server, not a real MCP handshake.
+```
+
+`--mode=discover` runs Discovery only (no enumeration/assessment) and prints the resolved `Fingerprint` — protocol, transport, confidence, server metadata — for every target. `--list-detectors` lists the registered detectors, the discovery-time sibling of `--list-probes`.
+
+Discovered/assumed transport also picks which `Session` implementation actually runs the scan: streamable-HTTP, legacy pre-2025-03-26 HTTP+SSE, or a raw WebSocket (non-standard, but observed in some community gateways) — each behind the same `Session` interface and the same no-invoke boundary, so every existing probe and template runs unmodified regardless of which one it lands on.
+
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10).
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), and each carries a stable rule ID, a confidence level, and — where a single request/response produced it — a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
 
 ### Capability surface: what is this endpoint willing to tell a stranger?
 
@@ -128,29 +167,34 @@ Drop a JSON template in `templates/`, no Go, no rebuild:
 
 ```json
 {
-  "id": "mcp-custom-header-leak",
+  "id": "mcp-tmpl-custom-header-leak",
   "protocol": "mcp",
-  "severity": "medium",
+  "info": {
+    "title": "Internal service header disclosed",
+    "severity": "medium",
+    "asi_refs": ["ASI09"],
+    "description": "tools/list responses disclose an internal-service header."
+  },
   "request": { "method": "tools/list" },
-  "matchers": {
-    "condition": "all",
-    "rules": [
-      { "type": "status_code", "values": [200] },
-      { "type": "header", "name": "X-Internal-Service", "present": true }
-    ]
-  }
+  "match_logic": "all",
+  "matchers": [
+    { "type": "status_code", "equals": 200 },
+    { "type": "header", "header": "X-Internal-Service" }
+  ]
 }
 ```
 
-Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` / `all`.
+Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` (default) / `all` via `match_logic`. See [`docs/WRITING_PROBES.md`](docs/WRITING_PROBES.md) for the full field reference, including `info.references` and how confidence/reproduction are derived automatically.
 
 A template deliberately **cannot** chain requests, branch on response data, or invoke a discovered tool. The first two are a roadmap item. The third never will be. If your check needs real logic, write a Go probe in `internal/probe/<protocol>/checks.go`, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Roadmap
 
+Shipped: automatic protocol/transport discovery (`--protocol auto`, `--mode discover`), confidence-scored findings with a hard downgrade for unconfirmed targets, legacy HTTP+SSE and WebSocket transports alongside streamable-HTTP.
+
 Planned, not yet shipped:
 
-- **Additional transports**: legacy HTTP+SSE, stdio, WebSocket, behind the same `Session` interface and the same no-invoke boundary.
+- **stdio transport**: a manually-specified local MCP server launch (`--target-stdio`), behind the same `Session` interface and the same no-invoke boundary.
 - **Bounded range discovery**: sweep an operator-supplied host and port list for agent endpoints.
 - **More protocols**: A2A, and whatever else reaches deployment scale.
 

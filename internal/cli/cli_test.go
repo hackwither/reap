@@ -224,6 +224,165 @@ func TestRun_ProtocolAutoUsesDiscovery(t *testing.T) {
 	}
 }
 
+// TestRun_BareOriginResolvesToRealEndpointPath is a regression test for a
+// real bug: given a bare origin like "https://api.x.com" (no path), the
+// server root doesn't speak MCP but "/mcp" does — the same shape as the
+// real target that prompted this fix. Discovery finding the right
+// candidate isn't enough on its own; the resolved endpoint URL must
+// actually be what gets scanned, not the original bare origin (which
+// would just time out against a root that was never an MCP listener).
+func TestRun_BareOriginResolvesToRealEndpointPath(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r) // root is NOT an MCP endpoint
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body.ID,
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+				"serverInfo":      map[string]any{"name": "bare-origin-gateway", "version": "1.0"},
+				"capabilities":    map[string]any{},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprintsDir := filepath.Join("..", "..", "fingerprints")
+	code := Run([]string{
+		"--protocol", "auto",
+		"--authorized",
+		"-t", srv.URL, // bare origin — httptest.NewServer's URL has no path
+		"--templates", "",
+		"--fingerprints", fingerprintsDir,
+		"--no-banner",
+		"--output", "json",
+		"--timeout", "3s",
+	}, outW, errW)
+
+	outW.Close()
+	errW.Close()
+	var outBuf, errBuf bytes.Buffer
+	if _, err := outBuf.ReadFrom(outR); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := errBuf.ReadFrom(errR); err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, errBuf.String())
+	}
+
+	var rep report.Report
+	if err := json.Unmarshal(outBuf.Bytes(), &rep); err != nil {
+		t.Fatalf("failed to decode report JSON: %v; stdout: %s", err, outBuf.String())
+	}
+	if rep.Target.URL != srv.URL+"/mcp" {
+		t.Fatalf("expected the report to reflect the resolved endpoint %s/mcp, got %q — discovery found it but the scan still hit the wrong URL", srv.URL, rep.Target.URL)
+	}
+	if !rep.Target.Confirmed {
+		t.Fatalf("expected the handshake against the resolved endpoint to succeed, got Confirmed=false, reason=%q", rep.Target.ConfirmReason)
+	}
+	if rep.Target.ServerName != "bare-origin-gateway" {
+		t.Fatalf("expected server_name from the real /mcp endpoint, got %q", rep.Target.ServerName)
+	}
+}
+
+// TestRun_BareOriginResolvesUnderStaticProtocol is the same regression as
+// above but WITHOUT --protocol auto — the default, static --protocol=mcp
+// path. "Which path" and "which protocol" are separate questions: a user
+// who already knows it's MCP (so doesn't pass --protocol auto) but only
+// has a bare origin (e.g. "https://api.x.com") still needs well-known-path
+// resolution, or the scan silently hits the wrong URL and times out
+// against a root that was never an MCP listener.
+func TestRun_BareOriginResolvesUnderStaticProtocol(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body.ID,
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+				"serverInfo":      map[string]any{"name": "static-protocol-gateway", "version": "1.0"},
+				"capabilities":    map[string]any{},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprintsDir := filepath.Join("..", "..", "fingerprints")
+	code := Run([]string{
+		// no --protocol flag at all: exercises the default "mcp" static path
+		"--authorized",
+		"-t", srv.URL,
+		"--templates", "",
+		"--fingerprints", fingerprintsDir,
+		"--no-banner",
+		"--output", "json",
+		"--timeout", "3s",
+	}, outW, errW)
+
+	outW.Close()
+	errW.Close()
+	var outBuf, errBuf bytes.Buffer
+	if _, err := outBuf.ReadFrom(outR); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := errBuf.ReadFrom(errR); err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, errBuf.String())
+	}
+
+	var rep report.Report
+	if err := json.Unmarshal(outBuf.Bytes(), &rep); err != nil {
+		t.Fatalf("failed to decode report JSON: %v; stdout: %s", err, outBuf.String())
+	}
+	if rep.Target.URL != srv.URL+"/mcp" {
+		t.Fatalf("expected the report to reflect the resolved endpoint %s/mcp under static --protocol=mcp, got %q", srv.URL, rep.Target.URL)
+	}
+	if !rep.Target.Confirmed {
+		t.Fatalf("expected the handshake against the resolved endpoint to succeed, got Confirmed=false, reason=%q", rep.Target.ConfirmReason)
+	}
+}
+
 func TestParseFlags_Verbose(t *testing.T) {
 	opts, _, err := parseFlags([]string{"-v", "--target", "https://example.com/mcp"})
 	if err != nil {
@@ -234,5 +393,38 @@ func TestParseFlags_Verbose(t *testing.T) {
 	}
 	if !opts.Verbose {
 		t.Fatal("expected verbose enabled for -v")
+	}
+}
+
+func TestParseFlags_Color(t *testing.T) {
+	for _, mode := range []string{"auto", "always", "never"} {
+		opts, _, err := parseFlags([]string{"--color", mode})
+		if err != nil {
+			t.Fatalf("--color %s: %v", mode, err)
+		}
+		if opts.Color != mode {
+			t.Fatalf("--color %s parsed as %q", mode, opts.Color)
+		}
+	}
+	if _, _, err := parseFlags([]string{"--color", "sometimes"}); err == nil {
+		t.Fatal("expected invalid --color value to fail")
+	}
+}
+
+func TestHumanColorEnabled(t *testing.T) {
+	output, err := os.CreateTemp(t.TempDir(), "report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+
+	if humanColorEnabled("auto", output) {
+		t.Fatal("auto color must be disabled for redirected output")
+	}
+	if !humanColorEnabled("always", output) {
+		t.Fatal("always must enable color for redirected output")
+	}
+	if humanColorEnabled("never", output) {
+		t.Fatal("never must disable color")
 	}
 }

@@ -13,6 +13,8 @@ package discovery
 import (
 	"context"
 	"time"
+
+	"github.com/hackwither/reap/internal/report"
 )
 
 type CandidateKind string
@@ -47,6 +49,12 @@ type Fingerprint struct {
 	ProtocolVer string
 	Evidence    map[string]any
 	DetectorID  string // which Detector produced this, for provenance/debugging
+
+	// Request is the single request/response this Fingerprint was matched
+	// from, in the same shape a Finding's reproduction uses — a detector
+	// firing "high confidence" on a target is exactly the kind of claim
+	// someone should be able to re-run themselves, same as any finding.
+	Request *report.HTTPExchange
 }
 
 // DetectOptions carries the same cross-cutting knobs probe.Probe already has

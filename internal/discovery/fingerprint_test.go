@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,4 +153,67 @@ func TestHTTPSSELegacyFingerprint_NoFalsePositiveOnPlainJSON(t *testing.T) {
 	if fp != nil {
 		t.Fatalf("expected no match against a plain JSON-RPC server, got %+v", fp)
 	}
+}
+
+// TestHTTPStreamableFingerprint_AuthGatedFallback is a regression test for
+// a real miss: a genuine MCP server whose /mcp requires auth answers an
+// unauthenticated initialize with a 401 that isn't JSON-RPC shaped (e.g.
+// {"title":"Unauthorized",...}, the exact shape api.x.com/mcp returns) — so
+// the real matchers never fire, and without this fallback, discovery finds
+// nothing and the scan falls back to the bare origin (usually a 404)
+// instead of the much more plausible /mcp candidate. A 401/403 at a
+// well-known path should surface as a low-confidence "auth-gated" match
+// rather than silently vanishing.
+func TestHTTPStreamableFingerprint_AuthGatedFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mcp" {
+			http.NotFound(w, r) // root and everything else: genuinely nothing there
+			return
+		}
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"title":"Unauthorized","type":"about:blank","status":401,"detail":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	fpt := loadBuiltinFingerprint(t, "mcp-http-streamable")
+	det := fpt.AsDetector()
+
+	// KindHostPort so well-known-path expansion runs — same shape a bare
+	// origin like "https://api.x.com" classifies as.
+	fp, err := det.Detect(context.Background(), Candidate{Kind: KindHostPort, Host: mustHost(t, srv.URL), Port: mustPort(t, srv.URL)}, DetectOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fp == nil {
+		t.Fatal("expected a low-confidence auth-gated match, got nil")
+	}
+	if fp.Confidence != "low" {
+		t.Fatalf("expected confidence=low for an unconfirmed auth-gated match, got %q", fp.Confidence)
+	}
+	if fp.Candidate.URL == "" || !strings.HasSuffix(fp.Candidate.URL, "/mcp") {
+		t.Fatalf("expected the resolved candidate to be the /mcp path, got %q", fp.Candidate.URL)
+	}
+}
+
+func mustHost(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Hostname()
+}
+
+func mustPort(t *testing.T, rawURL string) int {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }

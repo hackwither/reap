@@ -69,6 +69,13 @@ type Probe interface {
 	ID() string
 	// Protocol this probe applies to ("mcp", "a2a", "openai-functions", "*").
 	Protocol() string
+	// Transports lists which Session transports this probe can run over
+	// ("http-streamable", "http-sse-legacy", "websocket", "stdio"), or
+	// ["*"] if it only inspects JSON-RPC payload shape and doesn't care
+	// which transport carried it (e.g. a tools/list schema check). Probes
+	// that depend on HTTP-specific mechanics (headers, TLS, CORS) must
+	// list the transports they actually need rather than returning ["*"].
+	Transports() []string
 	// Run executes the probe and appends zero or more Findings to r.
 	// A probe returning an error means the probe itself failed to run
 	// (network error, etc.) — not that it "found" anything.
@@ -102,4 +109,33 @@ func (reg *Registry) ForProtocol(protocol string) []Probe {
 		}
 	}
 	return out
+}
+
+// ForProtocolAndTransport is ForProtocol further filtered to probes that
+// support the given transport (or declare themselves transport-agnostic
+// via "*"). An empty transport means "unknown/not yet resolved" and skips
+// transport filtering entirely — the existing static --protocol=mcp path
+// doesn't discover a transport up front, so it must keep running every
+// protocol-matched probe exactly as it did before this filter existed.
+func (reg *Registry) ForProtocolAndTransport(protocol, transport string) []Probe {
+	byProtocol := reg.ForProtocol(protocol)
+	if transport == "" {
+		return byProtocol
+	}
+	var out []Probe
+	for _, p := range byProtocol {
+		if supportsTransport(p.Transports(), transport) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func supportsTransport(supported []string, transport string) bool {
+	for _, t := range supported {
+		if t == "*" || t == transport {
+			return true
+		}
+	}
+	return false
 }

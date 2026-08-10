@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,8 +35,35 @@ func BuiltinProbes() []probe.Probe {
 		&instructionsExposureProbe{},
 		&resourcesPromptsExposureProbe{},
 		&dynamicDispatchProbe{},
+		&serverHeaderFingerprintProbe{},
 	}
 }
+
+// reproBody renders the exact JSON-RPC request body a probe sent, for the
+// HTTPExchange repro line — matches the envelope mcp.Session.Do builds (see
+// session.go's rpcRequest), with a fixed id since reproduction doesn't
+// depend on which request number this was in the session.
+func reproBody(method string, params any) string {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+	if err != nil {
+		return ""
+	}
+	return string(body)
+}
+
+// httpOnlyTransports is returned by probes whose check is inherently about
+// HTTP mechanics (headers, TLS, CORS, well-known metadata endpoints) and
+// therefore can't run meaningfully over a non-HTTP transport like stdio or
+// a raw WebSocket. anyTransport is returned by probes that only inspect
+// JSON-RPC payload shape and don't care which transport carried it.
+var httpOnlyTransports = []string{"http-streamable", "http-sse-legacy"}
+var anyTransport = []string{"*"}
+
+// streamableHTTPOnly is for probes that depend on a mechanism specific to
+// the streamable-HTTP session implementation (e.g. the Mcp-Session-Id
+// response header it captures) that has no equivalent in legacy-SSE or
+// WebSocket sessions.
+var streamableHTTPOnly = []string{"http-streamable"}
 
 func initializeParams() map[string]any {
 	return map[string]any{
@@ -52,20 +80,17 @@ func initializeParams() map[string]any {
 
 type tlsCertHealthProbe struct{}
 
-func (p *tlsCertHealthProbe) ID() string       { return "mcp-tls-cert-health" }
-func (p *tlsCertHealthProbe) Protocol() string { return "mcp" }
+func (p *tlsCertHealthProbe) ID() string           { return "mcp-tls-cert-health" }
+func (p *tlsCertHealthProbe) Protocol() string     { return "mcp" }
+func (p *tlsCertHealthProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	u, err := url.Parse(ms.TargetURL())
+	u, err := url.Parse(s.TargetURL())
 	if err != nil || u.Scheme != "https" {
 		return nil
 	}
 
-	state, cert, err := common.InspectTLS(ctx, ms.TargetURL())
+	state, cert, err := common.InspectTLS(ctx, s.TargetURL())
 	if err != nil {
 		return nil
 	}
@@ -109,11 +134,13 @@ func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report
 	}
 
 	r.AddFinding(report.Finding{
-		ID:       p.ID(),
-		Title:    "MCP TLS certificate health issues detected",
-		Severity: severity,
-		Protocol: "mcp",
-		ASI:      []string{"ASI09"},
+		ID:         p.ID(),
+		Title:      "MCP TLS certificate health issues detected",
+		Severity:   severity,
+		Confidence: "high", // direct TLS handshake inspection, not a heuristic
+		Protocol:   "mcp",
+		ASI:        []string{"ASI09"},
+		References: []string{"RFC 8446 (TLS 1.3)", "RFC 5280 (X.509 certificates)"},
 		Description: fmt.Sprintf(
 			"The TLS certificate for %s has one or more issues: %s.",
 			u.Host,
@@ -128,6 +155,9 @@ func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report
 			"certificate_issuer":  cert.Issuer.CommonName,
 			"certificate_subject": cert.Subject.CommonName,
 		},
+		// No HTTPExchange: this is a TLS-layer observation (openssl
+		// s_client territory), not a single HTTP request/response — doesn't
+		// fit the repro shape the way an HTTP-level finding does.
 		Remediation: "Use a valid TLS certificate from a trusted authority, ensure the certificate matches the host name, and retire weak TLS versions and cipher suites.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"transport", "tls"},
@@ -139,8 +169,9 @@ func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report
 
 type hostHeaderValidationProbe struct{}
 
-func (p *hostHeaderValidationProbe) ID() string       { return "mcp-host-header-validation" }
-func (p *hostHeaderValidationProbe) Protocol() string { return "mcp" }
+func (p *hostHeaderValidationProbe) ID() string           { return "mcp-host-header-validation" }
+func (p *hostHeaderValidationProbe) Protocol() string     { return "mcp" }
+func (p *hostHeaderValidationProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	foreignHost := "host-header-validation.invalid"
@@ -161,6 +192,7 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 		ID:          p.ID(),
 		Title:       "MCP accepted initialize with a mismatched Host header",
 		Severity:    report.SeverityHigh,
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI05"},
 		Description: fmt.Sprintf("The server processed an initialize request even though the Host header was set to %q. This indicates the server may not validate the requested host name before handling MCP traffic.", foreignHost),
@@ -168,6 +200,16 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 			"tested_host_header": foreignHost,
 			"server_name":        envelope.Result.ServerInfo.Name,
 			"server_version":     envelope.Result.ServerInfo.Version,
+		},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Headers:     map[string]string{"Host": foreignHost, "Content-Type": "application/json"},
+			Body:        reproBody("initialize", initializeParams()),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+			Expected:    "request rejected (4xx) for a Host header that doesn't match the configured endpoint",
 		},
 		Remediation: "Validate the Host header or equivalent request target before accepting MCP requests, and refuse requests whose host name does not match the configured endpoint.",
 		Source:      "builtin:mcp",
@@ -180,12 +222,16 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 
 type rateLimitAbsenceProbe struct{}
 
-func (p *rateLimitAbsenceProbe) ID() string       { return "mcp-rate-limit-absence" }
-func (p *rateLimitAbsenceProbe) Protocol() string { return "mcp" }
+func (p *rateLimitAbsenceProbe) ID() string           { return "mcp-rate-limit-absence" }
+func (p *rateLimitAbsenceProbe) Protocol() string     { return "mcp" }
+func (p *rateLimitAbsenceProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *rateLimitAbsenceProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	candidates := []string{"tools/list", "initialize"}
 	observedMethods := []string{}
+	var lastRaw *probe.RawResult
+	var lastMethod string
+	var lastParams any
 
 	for _, method := range candidates {
 		params := map[string]any{}
@@ -200,16 +246,18 @@ func (p *rateLimitAbsenceProbe) Run(ctx context.Context, s probe.Session, r *rep
 			return nil
 		}
 		observedMethods = append(observedMethods, method)
+		lastRaw, lastMethod, lastParams = raw, method, params
 	}
 
 	if len(observedMethods) == 0 {
 		return nil
 	}
 
-	r.AddFinding(report.Finding{
+	f := report.Finding{
 		ID:          p.ID(),
 		Title:       "No standard rate-limit headers observed on MCP endpoints",
-		Severity:    report.SeverityLow,
+		Severity:    report.SeverityInfo,
+		Confidence:  "medium", // absence-of-evidence signal, not a positive confirmation
 		Protocol:    "mcp",
 		ASI:         []string{"ASI08"},
 		Description: "Normal MCP requests succeeded, but no standard rate-limit response headers were present. This is a reconnaissance signal that the service may not be advertising rate limiting to clients.",
@@ -219,7 +267,19 @@ func (p *rateLimitAbsenceProbe) Run(ctx context.Context, s probe.Session, r *rep
 		Remediation: "Expose standard rate-limit headers such as Retry-After, RateLimit-Remaining, and X-RateLimit-Limit, or document the expected client behavior when limits are reached.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"rate-limit", "dos"},
-	})
+	}
+	if lastRaw != nil {
+		f.Request = &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody(lastMethod, lastParams),
+			StatusCode:  lastRaw.StatusCode,
+			ContentType: lastRaw.Headers.Get("Content-Type"),
+			BodySize:    len(lastRaw.Body),
+			Expected:    fmt.Sprintf("a rate-limit header (Retry-After, RateLimit-Remaining, ...) on the %s response", lastMethod),
+		}
+	}
+	r.AddFinding(f)
 	return nil
 }
 
@@ -227,15 +287,12 @@ func (p *rateLimitAbsenceProbe) Run(ctx context.Context, s probe.Session, r *rep
 
 type transportDowngradeProbe struct{}
 
-func (p *transportDowngradeProbe) ID() string       { return "mcp-transport-downgrade" }
-func (p *transportDowngradeProbe) Protocol() string { return "mcp" }
+func (p *transportDowngradeProbe) ID() string           { return "mcp-transport-downgrade" }
+func (p *transportDowngradeProbe) Protocol() string     { return "mcp" }
+func (p *transportDowngradeProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *transportDowngradeProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	u, err := url.Parse(ms.TargetURL())
+	u, err := url.Parse(s.TargetURL())
 	if err != nil || u.Scheme != "https" {
 		return nil
 	}
@@ -245,7 +302,7 @@ func (p *transportDowngradeProbe) Run(ctx context.Context, s probe.Session, r *r
 		paths = append(paths, "/sse")
 	}
 
-	fallbacks, err := common.DetectPlaintextListeners(ctx, ms.TargetURL(), paths)
+	fallbacks, err := common.DetectPlaintextListeners(ctx, s.TargetURL(), paths)
 	if err != nil {
 		return nil
 	}
@@ -258,14 +315,23 @@ func (p *transportDowngradeProbe) Run(ctx context.Context, s probe.Session, r *r
 		evidence = append(evidence, map[string]any{"path": fallback.Path, "status": fallback.StatusCode, "content_type": fallback.ContentType})
 	}
 
+	first := fallbacks[0]
 	r.AddFinding(report.Finding{
 		ID:          p.ID(),
 		Title:       "MCP endpoint also responds over plaintext HTTP",
 		Severity:    report.SeverityMedium,
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: "The target host also accepted at least one plaintext HTTP path for MCP-style traffic, which undermines TLS protections.",
 		Evidence:    map[string]any{"fallbacks": evidence},
+		Request: &report.HTTPExchange{
+			Method:      "GET",
+			URL:         fmt.Sprintf("http://%s%s", u.Host, first.Path),
+			StatusCode:  first.StatusCode,
+			ContentType: first.ContentType,
+			Expected:    "connection refused or a redirect to https://, not a 200 over plaintext",
+		},
 		Remediation: "Disable plaintext HTTP listeners for MCP endpoints and accept MCP traffic only over TLS.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"transport", "downgrade"},
@@ -277,73 +343,106 @@ func (p *transportDowngradeProbe) Run(ctx context.Context, s probe.Session, r *r
 
 type oauthMetadataPostureProbe struct{}
 
-func (p *oauthMetadataPostureProbe) ID() string       { return "mcp-oauth-metadata-posture" }
-func (p *oauthMetadataPostureProbe) Protocol() string { return "mcp" }
+func (p *oauthMetadataPostureProbe) ID() string           { return "mcp-oauth-metadata-posture" }
+func (p *oauthMetadataPostureProbe) Protocol() string     { return "mcp" }
+func (p *oauthMetadataPostureProbe) Transports() []string { return httpOnlyTransports }
 
+// oauthMetadataPostureProbe checks two independent RFC-defined signals and
+// deliberately does NOT conflate them into one finding, because they live
+// in different places and a 404 on one says nothing about the other:
+//
+//   - The Bearer challenge (RFC 9728 §5.1) belongs on the 401 response from
+//     the protected resource itself (the MCP endpoint), not on any
+//     .well-known metadata document. Checking the metadata response's
+//     headers for it — as an earlier version of this probe did — means the
+//     probe reports "missing" on every correctly-configured server, since
+//     the metadata endpoint was never the right place to look.
+//   - PKCE advertisement (RFC 8414) is a property of a published
+//     authorization-server metadata document. It can only be "missing" if
+//     that document was actually reachable (HTTP 200 + valid JSON) — a 404
+//     means "not published," a materially different, less actionable
+//     signal that must not be reported as "published but incomplete."
 func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
+	// --- Bearer challenge: observed on the resource's own 401, not metadata. ---
+	unauthRaw, unauthErr := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	sawChallenge := unauthErr == nil && unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
+	if sawChallenge {
+		wwwAuth := unauthRaw.Headers.Get("WWW-Authenticate")
+		if !strings.Contains(strings.ToLower(wwwAuth), "bearer") {
+			r.AddFinding(report.Finding{
+				ID:          "mcp-oauth-bearer-challenge-missing",
+				Title:       "Protected resource does not send a Bearer WWW-Authenticate challenge",
+				Severity:    report.SeverityMedium,
+				Confidence:  "high", // directly observed on the actual protected-resource response
+				Protocol:    "mcp",
+				ASI:         []string{"ASI03"},
+				References:  []string{"RFC 9728 (Protected Resource Metadata)", "RFC 6750 (Bearer Token Usage)"},
+				Description: fmt.Sprintf("An unauthenticated tools/list request returned %d, but its WWW-Authenticate header did not include a Bearer challenge (got %q).", unauthRaw.StatusCode, wwwAuth),
+				Evidence:    map[string]any{"www_authenticate": wwwAuth},
+				Request: &report.HTTPExchange{
+					Method:      "POST",
+					URL:         s.TargetURL(),
+					Body:        reproBody("tools/list", map[string]any{}),
+					StatusCode:  unauthRaw.StatusCode,
+					ContentType: unauthRaw.Headers.Get("Content-Type"),
+					BodySize:    len(unauthRaw.Body),
+					Expected:    `WWW-Authenticate header containing "Bearer"`,
+				},
+				Remediation: "Send a WWW-Authenticate: Bearer challenge (optionally with a resource_metadata parameter per RFC 9728) on unauthenticated requests to protected MCP endpoints.",
+				Source:      "builtin:mcp",
+				Tags:        []string{"oauth", "authn"},
+			})
+		}
 	}
-	u, err := url.Parse(ms.TargetURL())
+
+	// --- PKCE advertisement: only claimed against metadata that actually published (200). ---
+	u, err := url.Parse(s.TargetURL())
 	if err != nil {
 		return nil
 	}
 	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	paths := []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"}
-	observed := []string{}
-	bearerChallenge := false
 	pkceAdvertised := false
+	published := false
+	var publishedPath string
+	var publishedStatus int
+	var publishedContentType string
 
 	for _, pth := range paths {
 		metadata, headers, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
-		if err != nil {
-			continue
+		if err != nil || status != http.StatusOK || metadata == nil {
+			continue // 404 (or any non-200) means "not published," not "published but incomplete"
 		}
-		if status == 0 {
-			continue
-		}
-		observed = append(observed, pth)
-		if strings.Contains(strings.ToLower(headers.Get("WWW-Authenticate")), "bearer") {
-			bearerChallenge = true
-		}
+		published = true
+		publishedPath, publishedStatus, publishedContentType = pth, status, headers.Get("Content-Type")
 		if supportsPKCE(metadata) {
 			pkceAdvertised = true
 		}
 	}
 
-	if len(observed) == 0 {
-		return nil
+	if published && !pkceAdvertised {
+		r.AddFinding(report.Finding{
+			ID:          p.ID(),
+			Title:       "Published OAuth metadata does not advertise PKCE",
+			Severity:    report.SeverityLow,
+			Confidence:  "high", // directly read from a metadata document that actually returned 200
+			Protocol:    "mcp",
+			ASI:         []string{"ASI03"},
+			References:  []string{"RFC 8414 (Authorization Server Metadata)", "RFC 7636 (PKCE)"},
+			Description: fmt.Sprintf("OAuth metadata was published at %s, but it does not advertise PKCE (code_challenge_methods_supported) support.", publishedPath),
+			Evidence:    map[string]any{"published_path": publishedPath},
+			Request: &report.HTTPExchange{
+				Method:      "GET",
+				URL:         baseURL + publishedPath,
+				StatusCode:  publishedStatus,
+				ContentType: publishedContentType,
+				Expected:    `code_challenge_methods_supported: ["S256"]`,
+			},
+			Remediation: "Advertise PKCE support (code_challenge_methods_supported: [\"S256\"]) in published OAuth authorization-server metadata.",
+			Source:      "builtin:mcp",
+			Tags:        []string{"oauth", "authz"},
+		})
 	}
-	if bearerChallenge && pkceAdvertised {
-		return nil
-	}
-
-	descParts := []string{}
-	if !bearerChallenge {
-		descParts = append(descParts, "did not observe a Bearer WWW-Authenticate challenge")
-	}
-	if !pkceAdvertised {
-		descParts = append(descParts, "did not observe PKCE support advertised in OAuth metadata")
-	}
-	description := fmt.Sprintf("OAuth metadata endpoints were reachable at %s, but %s.", strings.Join(observed, ", "), strings.Join(descParts, " and "))
-	severity := report.SeverityLow
-	if !bearerChallenge && !pkceAdvertised {
-		severity = report.SeverityMedium
-	}
-
-	r.AddFinding(report.Finding{
-		ID:          p.ID(),
-		Title:       "OAuth metadata posture requires review",
-		Severity:    severity,
-		Protocol:    "mcp",
-		ASI:         []string{"ASI03"},
-		Description: description,
-		Evidence:    map[string]any{"observed_paths": observed, "bearer_challenge": bearerChallenge, "pkce_advertised": pkceAdvertised},
-		Remediation: "Publish OAuth metadata endpoints with a Bearer WWW-Authenticate challenge and advertise PKCE support for authorization flows.",
-		Source:      "builtin:mcp",
-		Tags:        []string{"oauth", "authn", "authz"},
-	})
 	return nil
 }
 
@@ -414,26 +513,26 @@ func containsStringValue(value any, expected string) bool {
 
 type redirectUriLaxityProbe struct{}
 
-func (p *redirectUriLaxityProbe) ID() string       { return "mcp-redirect-uri-laxity" }
-func (p *redirectUriLaxityProbe) Protocol() string { return "mcp" }
+func (p *redirectUriLaxityProbe) ID() string           { return "mcp-redirect-uri-laxity" }
+func (p *redirectUriLaxityProbe) Protocol() string     { return "mcp" }
+func (p *redirectUriLaxityProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	u, err := url.Parse(ms.TargetURL())
+	u, err := url.Parse(s.TargetURL())
 	if err != nil {
 		return nil
 	}
 	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	paths := []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"}
 	redirectURIs := []string{}
+	var lastPath string
+	var lastStatus int
 	for _, pth := range paths {
 		metadata, _, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
-		if err != nil || status == 0 || metadata == nil {
-			continue
+		if err != nil || status != http.StatusOK || metadata == nil {
+			continue // 404 (or any non-200) is "not published," not parseable metadata
 		}
+		lastPath, lastStatus = pth, status
 		redirectURIs = append(redirectURIs, findRedirectURIs(metadata)...)
 	}
 	if len(redirectURIs) == 0 {
@@ -452,11 +551,19 @@ func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *re
 		ID:          p.ID(),
 		Title:       "OAuth redirect URI registration appears overly broad",
 		Severity:    report.SeverityMedium,
+		Confidence:  "medium",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
+		References:  []string{"RFC 6749 §3.1.2 (Redirection Endpoint)", "RFC 8252 (OAuth for Native Apps)"},
 		Description: "The discovered OAuth metadata includes redirect URIs that are broad or wildcarded, which increases the risk of confused-deputy or open redirect abuse.",
 		Evidence: map[string]any{
 			"redirect_uris": broad,
+		},
+		Request: &report.HTTPExchange{
+			Method:     "GET",
+			URL:        baseURL + lastPath,
+			StatusCode: lastStatus,
+			Expected:   "redirect_uris scoped to exact origins/paths, no wildcards",
 		},
 		Remediation: "Restrict registered redirect URIs to exact allowed origins and paths, and avoid wildcards or overly permissive URL patterns.",
 		Source:      "builtin:mcp",
@@ -516,8 +623,9 @@ func isBroadRedirectURI(target string) bool {
 
 type sessionIDEntropyProbe struct{}
 
-func (p *sessionIDEntropyProbe) ID() string       { return "mcp-session-id-entropy" }
-func (p *sessionIDEntropyProbe) Protocol() string { return "mcp" }
+func (p *sessionIDEntropyProbe) ID() string           { return "mcp-session-id-entropy" }
+func (p *sessionIDEntropyProbe) Protocol() string     { return "mcp" }
+func (p *sessionIDEntropyProbe) Transports() []string { return streamableHTTPOnly }
 
 func (p *sessionIDEntropyProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	ms, err := asSession(s)
@@ -540,14 +648,19 @@ func (p *sessionIDEntropyProbe) Run(ctx context.Context, s probe.Session, r *rep
 		ID:          p.ID(),
 		Title:       "MCP session ID entropy looks weak or predictable",
 		Severity:    severity,
+		Confidence:  "high", // directly measured against the ID string itself, not a heuristic guess
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
+		References:  []string{"NIST SP 800-63B §5.1.1 (session identifier entropy)"},
 		Description: fmt.Sprintf("The MCP session ID returned by the server appears to have low entropy or a predictable format: %s", strings.Join(issues, ", ")),
 		Evidence: map[string]any{
 			"session_id":             ms.sessionID,
 			"estimated_entropy_bits": entropy,
 			"issues":                 issues,
 		},
+		// No HTTPExchange: the session ID was captured from the
+		// Mcp-Session-Id response header on an earlier, arbitrary call, not
+		// a single request this probe made itself.
 		Remediation: "Use a cryptographically random, high-entropy session identifier for MCP sessions and avoid sequential or human-readable formats.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"session", "auth"},
@@ -613,8 +726,9 @@ func asSession(s probe.Session) (*Session, error) {
 
 type unauthToolsListProbe struct{}
 
-func (p *unauthToolsListProbe) ID() string       { return "mcp-unauth-tools-list" }
-func (p *unauthToolsListProbe) Protocol() string { return "mcp" }
+func (p *unauthToolsListProbe) ID() string           { return "mcp-unauth-tools-list" }
+func (p *unauthToolsListProbe) Protocol() string     { return "mcp" }
+func (p *unauthToolsListProbe) Transports() []string { return anyTransport }
 
 func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	// Re-issue tools/list explicitly WITHOUT the auth header, regardless of
@@ -660,10 +774,20 @@ func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *repo
 		ID:          p.ID(),
 		Title:       "MCP tool listing accessible without authentication",
 		Severity:    sev,
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI02", "ASI03"},
 		Description: fmt.Sprintf("tools/list returned %d tool(s) to an unauthenticated caller: %s", len(names), strings.Join(names, ", ")),
 		Evidence:    map[string]any{"tool_count": len(names), "tool_names": names},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+			Expected:    "401/403 for an anonymous (no Authorization header) tools/list call",
+		},
 		Remediation: "Require authentication before tools/list, or scope the response so anonymous callers see nothing.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"auth", "enumeration"},
@@ -685,6 +809,49 @@ func hasHighRiskTool(names []string) bool {
 	return false
 }
 
+// dangerousToolCategories maps a capability category to name/description
+// keyword hints suggesting a tool has it — the agent-native equivalent of
+// nmap flagging port 22 open. A security engineer looking at a tool
+// inventory wants "which of these touch the filesystem, spawn a shell,
+// reach out to the network, or handle secrets" without reading every
+// inputSchema by hand.
+var dangerousToolCategories = map[string][]string{
+	"filesystem":       {"read_file", "write_file", "readfile", "writefile", "delete_file", "list_dir", "list_directory"},
+	"shell_exec":       {"exec", "shell", "eval", "run_command", "subprocess", "bash", "powershell"},
+	"network_egress":   {"fetch_url", "http_request", "curl", "download", "webhook", "fetch"},
+	"database":         {"sql", "query_db", "database"},
+	"browser_control":  {"browser", "puppeteer", "playwright"},
+	"secrets_handling": {"api_key", "credential", "password", "secret", "token"},
+}
+
+// dangerousTools inspects a tools/list result and returns, per tool name,
+// which dangerous-capability categories it appears to fall into by name or
+// description — same keyword-heuristic ceiling as hasHighRiskTool above,
+// but surfaced as first-class inventory (every match, not just "any match
+// found") rather than folded into a single severity bump.
+func dangerousTools(tools []map[string]any) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range tools {
+		name, _ := t["name"].(string)
+		desc, _ := t["description"].(string)
+		text := strings.ToLower(name + " " + desc)
+		var cats []string
+		for cat, hints := range dangerousToolCategories {
+			for _, h := range hints {
+				if strings.Contains(text, h) {
+					cats = append(cats, cat)
+					break
+				}
+			}
+		}
+		if len(cats) > 0 {
+			sort.Strings(cats)
+			out[name] = cats
+		}
+	}
+	return out
+}
+
 // --- tool-capability-surface -------------------------------------------
 
 // This probe doesn't flag a vulnerability by itself — it records the full
@@ -692,12 +859,43 @@ func hasHighRiskTool(names []string) bool {
 // asset inventory even when nothing else fires.
 type toolCapabilitySurfaceProbe struct{}
 
-func (p *toolCapabilitySurfaceProbe) ID() string       { return "mcp-tool-capability-surface" }
-func (p *toolCapabilitySurfaceProbe) Protocol() string { return "mcp" }
+func (p *toolCapabilitySurfaceProbe) ID() string           { return "mcp-tool-capability-surface" }
+func (p *toolCapabilitySurfaceProbe) Protocol() string     { return "mcp" }
+func (p *toolCapabilitySurfaceProbe) Transports() []string { return anyTransport }
 
 func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	raw, err := s.Do(ctx, "tools/list", map[string]any{})
-	if err != nil || raw.StatusCode != 200 {
+	if err != nil {
+		return nil
+	}
+	if raw.StatusCode == http.StatusUnauthorized || raw.StatusCode == http.StatusForbidden {
+		// REAP's whole pitch is enumerating the agent surface — going
+		// silent when that's blocked reads as "the feature isn't there."
+		// A server correctly gating tools/list behind auth is a legitimate,
+		// informative outcome; say so instead of just returning nothing.
+		r.AddFinding(report.Finding{
+			ID:          "mcp-enumeration-blocked",
+			Title:       "Tool enumeration blocked by authentication",
+			Severity:    report.SeverityInfo,
+			Confidence:  "high",
+			Protocol:    "mcp",
+			ASI:         []string{"ASI09"},
+			Description: fmt.Sprintf("tools/list returned %d without credentials — the server correctly gates enumeration behind authentication, so no tool inventory is available from this vantage point.", raw.StatusCode),
+			Evidence:    map[string]any{"status_code": raw.StatusCode},
+			Request: &report.HTTPExchange{
+				Method:      "POST",
+				URL:         s.TargetURL(),
+				Body:        reproBody("tools/list", map[string]any{}),
+				StatusCode:  raw.StatusCode,
+				ContentType: raw.Headers.Get("Content-Type"),
+				BodySize:    len(raw.Body),
+			},
+			Source: "builtin:mcp",
+			Tags:   []string{"inventory", "auth"},
+		})
+		return nil
+	}
+	if raw.StatusCode != 200 {
 		return nil
 	}
 	var envelope struct {
@@ -713,12 +911,21 @@ func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r
 		ID:          p.ID(),
 		Title:       fmt.Sprintf("Tool capability inventory (%d tools)", len(envelope.Result.Tools)),
 		Severity:    report.SeverityInfo,
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: "Full tool surface exposed by this endpoint, for asset-inventory and diffing purposes.",
-		Evidence:    map[string]any{"tools": envelope.Result.Tools},
-		Source:      "builtin:mcp",
-		Tags:        []string{"inventory"},
+		Evidence:    map[string]any{"tools": envelope.Result.Tools, "dangerous_tools": dangerousTools(envelope.Result.Tools)},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
+		Source: "builtin:mcp",
+		Tags:   []string{"inventory"},
 	})
 	return nil
 }
@@ -727,8 +934,9 @@ func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r
 
 type corsWildcardProbe struct{}
 
-func (p *corsWildcardProbe) ID() string       { return "mcp-cors-wildcard" }
-func (p *corsWildcardProbe) Protocol() string { return "mcp" }
+func (p *corsWildcardProbe) ID() string           { return "mcp-cors-wildcard" }
+func (p *corsWildcardProbe) Protocol() string     { return "mcp" }
+func (p *corsWildcardProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *corsWildcardProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithHeader("Origin", "https://reap-cors-probe.invalid"))
@@ -749,10 +957,21 @@ func (p *corsWildcardProbe) Run(ctx context.Context, s probe.Session, r *report.
 		ID:          p.ID(),
 		Title:       "Permissive CORS policy on MCP endpoint",
 		Severity:    sev,
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
+		References:  []string{"Fetch (CORS) — WHATWG Living Standard"},
 		Description: desc,
 		Evidence:    map[string]any{"access_control_allow_origin": raw.Headers.Get("Access-Control-Allow-Origin"), "access_control_allow_credentials": raw.Headers.Get("Access-Control-Allow-Credentials")},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Headers:     map[string]string{"Origin": "https://reap-cors-probe.invalid"},
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			Expected:    "Access-Control-Allow-Origin scoped to a known first-party origin, not *",
+		},
 		Remediation: "Scope Access-Control-Allow-Origin to known first-party origins; never combine * with credentialed requests.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"cors", "browser-exposure"},
@@ -764,25 +983,28 @@ func (p *corsWildcardProbe) Run(ctx context.Context, s probe.Session, r *report.
 
 type plaintextTransportProbe struct{}
 
-func (p *plaintextTransportProbe) ID() string       { return "mcp-plaintext-transport" }
-func (p *plaintextTransportProbe) Protocol() string { return "mcp" }
+func (p *plaintextTransportProbe) ID() string           { return "mcp-plaintext-transport" }
+func (p *plaintextTransportProbe) Protocol() string     { return "mcp" }
+func (p *plaintextTransportProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *plaintextTransportProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	if !common.IsPlaintextURL(ms.TargetURL()) {
+	if !common.IsPlaintextURL(s.TargetURL()) {
 		return nil
 	}
 	r.AddFinding(report.Finding{
 		ID:          p.ID(),
 		Title:       "MCP endpoint served over plaintext HTTP",
 		Severity:    report.SeverityMedium,
+		Confidence:  "high", // direct fact about the target URL's scheme, not inferred
 		Protocol:    "mcp",
 		ASI:         []string{"ASI04"},
 		Description: "Target URL uses http:// rather than https://. Tool calls, arguments, and any auth tokens are visible to on-path observers.",
-		Evidence:    map[string]any{"url": ms.TargetURL()},
+		Evidence:    map[string]any{"url": s.TargetURL()},
+		Request: &report.HTTPExchange{
+			Method:   "GET",
+			URL:      s.TargetURL(),
+			Expected: "https:// scheme",
+		},
 		Remediation: "Serve MCP endpoints over TLS only; redirect or refuse plaintext connections.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"transport"},
@@ -799,15 +1021,12 @@ func (p *plaintextTransportProbe) Run(ctx context.Context, s probe.Session, r *r
 // prompt if the server hands it over during the handshake.
 type instructionsExposureProbe struct{}
 
-func (p *instructionsExposureProbe) ID() string       { return "mcp-instructions-exposure" }
-func (p *instructionsExposureProbe) Protocol() string { return "mcp" }
+func (p *instructionsExposureProbe) ID() string           { return "mcp-instructions-exposure" }
+func (p *instructionsExposureProbe) Protocol() string     { return "mcp" }
+func (p *instructionsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	init, raw, err := ms.Initialize(ctx)
+	init, raw, err := InitializeSession(ctx, s)
 	if err != nil || raw == nil || raw.StatusCode != 200 || init == nil {
 		return nil
 	}
@@ -830,10 +1049,19 @@ func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r 
 		ID:          p.ID(),
 		Title:       "MCP handshake returns lengthy or sensitive-flavored instructions",
 		Severity:    report.SeverityLow,
+		Confidence:  "medium", // keyword/length heuristic on free text, explicitly not a confirmed leak
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: "The initialize response's 'instructions' field is long and/or contains language patterns (secrecy directives, 'internal', credential-related terms) worth a human review to confirm it isn't leaking operational or internal detail to any caller.",
 		Evidence:    map[string]any{"instructions_length": len(init.Instructions), "instructions_excerpt": excerpt(init.Instructions, 200)},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("initialize", initializeParams()),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
 		Remediation: "Keep client-facing instructions limited to usage guidance; keep anything sensitive out of fields returned pre-authentication.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"information-disclosure"},
@@ -852,8 +1080,9 @@ func excerpt(s string, n int) string {
 
 type resourcesPromptsExposureProbe struct{}
 
-func (p *resourcesPromptsExposureProbe) ID() string       { return "mcp-resources-prompts-exposure" }
-func (p *resourcesPromptsExposureProbe) Protocol() string { return "mcp" }
+func (p *resourcesPromptsExposureProbe) ID() string           { return "mcp-resources-prompts-exposure" }
+func (p *resourcesPromptsExposureProbe) Protocol() string     { return "mcp" }
+func (p *resourcesPromptsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	for _, method := range []string{"resources/list", "prompts/list"} {
@@ -882,10 +1111,20 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 			ID:          p.ID() + "-" + strings.ReplaceAll(method, "/", "-"),
 			Title:       fmt.Sprintf("Unauthenticated %s returns %d item(s)", method, count),
 			Severity:    report.SeverityLow,
+			Confidence:  "high",
 			Protocol:    "mcp",
 			ASI:         []string{"ASI02"},
 			Description: fmt.Sprintf("%s succeeded without credentials and returned %d item(s) to an anonymous caller.", method, count),
 			Evidence:    map[string]any{"method": method, "item_count": count},
+			Request: &report.HTTPExchange{
+				Method:      "POST",
+				URL:         s.TargetURL(),
+				Body:        reproBody(method, map[string]any{}),
+				StatusCode:  raw.StatusCode,
+				ContentType: raw.Headers.Get("Content-Type"),
+				BodySize:    len(raw.Body),
+				Expected:    "401/403 for an anonymous " + method + " call",
+			},
 			Remediation: "Gate resource/prompt listings behind authentication if their contents aren't meant to be public.",
 			Source:      "builtin:mcp",
 			Tags:        []string{"auth", "enumeration"},
@@ -921,8 +1160,9 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 // deliberately avoid these naming/schema signals.
 type dynamicDispatchProbe struct{}
 
-func (p *dynamicDispatchProbe) ID() string       { return "mcp-dynamic-dispatch" }
-func (p *dynamicDispatchProbe) Protocol() string { return "mcp" }
+func (p *dynamicDispatchProbe) ID() string           { return "mcp-dynamic-dispatch" }
+func (p *dynamicDispatchProbe) Protocol() string     { return "mcp" }
+func (p *dynamicDispatchProbe) Transports() []string { return anyTransport }
 
 func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	raw, err := s.Do(ctx, "tools/list", map[string]any{})
@@ -992,12 +1232,21 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 		ID:          p.ID(),
 		Title:       "Enumerated MCP tool surface is likely incomplete (dynamic dispatch detected)",
 		Severity:    severity,
+		Confidence:  "medium", // naming/schema-convention heuristic, deliberately evadable — see package comment above
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: description,
 		Evidence: map[string]any{
 			"search_tools":   searchTools,
 			"dispatch_tools": dispatcherTools,
+		},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
 		},
 		Remediation: "Expose a complete dispatchable tool manifest or provide a discoverable read-only tool inventory (for example, an extended list endpoint) so downstream security tooling can account for the full surface.",
 		Source:      "builtin:mcp",

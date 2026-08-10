@@ -1,0 +1,76 @@
+version: 2
+
+project_name: reap
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: reap
+    main: ./cmd/reap
+    binary: reap
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X github.com/hackwither/reap/internal/cli.Version={{.Version}}
+
+archives:
+  - id: reap
+    ids: [reap]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - templates/**/*
+      - fingerprints/**/*
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: hackwither
+    name: reap
+  draft: false
+  prerelease: auto
+
+homebrew_casks:
+  - name: reap
+    binaries:
+      - reap
+    repository:
+      owner: hackwither
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/hackwither/reap"
+    description: "Reconnaissance and Enumeration for Agent Protocols — active recon for MCP and other AI agent endpoints"

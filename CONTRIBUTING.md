@@ -25,6 +25,17 @@ go build ./...
 go test ./...
 ```
 
+## Releasing (maintainers)
+
+Releases are fully automated by GoReleaser from a pushed git tag — nothing to bump by hand, the version is derived from the tag:
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+This triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds cross-platform binaries, publishes a GitHub Release with checksums and a changelog, updates the `hackwither/homebrew-tap` cask, and pushes a multi-arch image to `ghcr.io/hackwither/reap`. See [`.goreleaser.yml`](.goreleaser.yml) for the exact build/publish steps. One-time setup (tap repo + `HOMEBREW_TAP_GITHUB_TOKEN` secret) only needs to happen once, before the first tag.
+
 ## Reporting exposures you find while testing this project
 
 If you're testing reap itself against a real MCP server and it surfaces something concerning, that's a finding about *their* system, not ours — see the disclosure norms in [`SECURITY.md`](SECURITY.md). Please don't paste live, unredacted findings from third-party systems into GitHub issues here.

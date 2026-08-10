@@ -16,3 +16,9 @@ check: fmt vet build test
 
 run-list: build
 	./bin/reap --list-probes
+
+docker-build:
+	docker build -t reap:dev .
+
+snapshot:
+	goreleaser build --snapshot --clean

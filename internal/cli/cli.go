@@ -11,13 +11,18 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hackwither/reap/internal/discovery"
 	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/probe/common"
 	"github.com/hackwither/reap/internal/probe/mcp"
 	"github.com/hackwither/reap/internal/report"
 	"github.com/hackwither/reap/internal/template"
@@ -110,7 +115,20 @@ type Options struct {
 	Authorized      bool
 	Concurrency     int
 	Verbose         bool
+	Quiet           bool
+	Color           string
+	FailOn          string
 	Logger          *log.Logger
+}
+
+// progress prints a short stage-transition line to stderr, on by default —
+// unlike -v/--verbose (dense, per-probe), this is the coarse "what phase is
+// this scan in" signal nmap/nuclei both show without being asked.
+func progress(opts *Options, stderr *os.File, format string, args ...any) {
+	if opts.Quiet {
+		return
+	}
+	fmt.Fprintf(stderr, "  "+format+"\n", args...)
 }
 
 func verboseLog(opts *Options, format string, args ...any) {
@@ -118,6 +136,20 @@ func verboseLog(opts *Options, format string, args ...any) {
 		return
 	}
 	opts.Logger.Printf(format, args...)
+}
+
+func humanColorEnabled(mode string, output *os.File) bool {
+	switch mode {
+	case "always":
+		return true
+	case "never":
+		return false
+	}
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := output.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func Run(args []string, stdout, stderr *os.File) int {
@@ -133,7 +165,7 @@ func Run(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintf(stdout, "reap v%s\n", Version)
 		return 0
 	}
-	if !opts.NoBanner {
+	if !opts.NoBanner && !opts.Quiet {
 		PrintBanner(stderr)
 	}
 	if opts.Verbose {
@@ -222,11 +254,27 @@ func classifyCandidate(target string) discovery.Candidate {
 	var c discovery.Candidate
 	c.RawInput = target
 	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		// A bare origin (no path, or just "/") hasn't told us where the
+		// actual endpoint lives — e.g. "https://api.x.com" with the real
+		// MCP endpoint at "/mcp". Treat it like a bare host:port so
+		// well-known-path expansion gets a chance to find it, instead of
+		// trying the origin verbatim (which finds nothing) the way a
+		// fully-specified endpoint URL like ".../mcp" would be tried as-is.
+		if u, err := url.Parse(target); err == nil && (u.Path == "" || u.Path == "/") {
+			c.Kind = discovery.KindHostPort
+			c.Host = u.Hostname()
+			if portStr := u.Port(); portStr != "" {
+				if port, err := strconv.Atoi(portStr); err == nil {
+					c.Port = port
+				}
+			}
+			return c
+		}
 		c.Kind = discovery.KindURL
 		c.URL = target
-	} else {
-		c.Kind = discovery.KindHostPort
+		return c
 	}
+	c.Kind = discovery.KindHostPort
 	return c
 }
 
@@ -235,16 +283,49 @@ func classifyCandidate(target string) discovery.Candidate {
 // resolved protocol to scan with. For any other --protocol value it's a
 // no-op passthrough. Falls back to "mcp" when discovery finds nothing,
 // since that's the only implemented protocol pipeline today.
-func resolveViaDiscovery(ctx context.Context, target string, opts *Options, rep *report.Report, stderr *os.File) string {
+// resolveViaDiscovery runs Discovery (when opts.Protocol == "auto") and
+// returns both the resolved protocol AND the resolved endpoint URL to
+// actually scan. The second part matters as much as the first: a bare
+// origin like "https://api.x.com" only tells Discovery where to start
+// looking — the real endpoint well-known-path expansion finds (e.g.
+// ".../mcp") lives on the matched Fingerprint's Candidate, not on the
+// input string. Returning just the protocol and leaving the caller to scan
+// the original bare origin is exactly the bug where discovery "finds" the
+// right endpoint but the scan still hits the wrong URL and times out.
+func resolveViaDiscovery(ctx context.Context, target string, opts *Options, rep *report.Report, stderr *os.File) (protocol, resolvedTarget string) {
+	candidate := classifyCandidate(target)
+
 	if opts.Protocol != "auto" {
-		return opts.Protocol
+		if candidate.Kind != discovery.KindHostPort {
+			// A full endpoint URL (has a real path) — the user told us
+			// exactly where it is, nothing to resolve.
+			return opts.Protocol, target
+		}
+		// A bare origin (e.g. "https://api.x.com") under a fixed
+		// --protocol: the protocol is asserted, but the path isn't known
+		// any more than it is under --protocol=auto. "Which path" and
+		// "which protocol" are separate questions — resolve the path via
+		// the same well-known-path discovery, restricted to confirming an
+		// endpoint for the protocol already asserted, without touching
+		// which protocol actually runs.
+		fp := runDiscovery(ctx, candidate, opts, stderr)
+		if fp == nil || fp.Protocol != opts.Protocol || fp.Candidate.URL == "" {
+			verboseLog(opts, "no %s endpoint found via well-known paths for %s, scanning the bare origin as given", opts.Protocol, target)
+			return opts.Protocol, target
+		}
+		rep.Target.Transport = fp.Transport
+		rep.Target.DiscoveryMethod = fp.DetectorID
+		rep.Target.DiscoveryConfidence = fp.Confidence
+		rep.Target.URL = fp.Candidate.URL
+		verboseLog(opts, "resolved bare origin %s -> %s (detector=%s)", target, fp.Candidate.URL, fp.DetectorID)
+		return opts.Protocol, fp.Candidate.URL
 	}
-	dreg := buildDiscoveryRegistry(opts, stderr)
-	fp := discovery.Run(ctx, dreg, classifyCandidate(target), discovery.DetectOptions{Timeout: opts.Timeout, AuthHeader: opts.AuthHeader})
+
+	fp := runDiscovery(ctx, candidate, opts, stderr)
 	if fp == nil {
 		rep.Target.DiscoveryMethod = "none"
 		verboseLog(opts, "discovery found nothing for %s, falling back to mcp", target)
-		return "mcp"
+		return "mcp", target
 	}
 	rep.Target.Protocol = fp.Protocol
 	rep.Target.Transport = fp.Transport
@@ -259,8 +340,38 @@ func resolveViaDiscovery(ctx context.Context, target string, opts *Options, rep 
 	if fp.ProtocolVer != "" {
 		rep.Target.ProtocolVer = fp.ProtocolVer
 	}
-	verboseLog(opts, "discovery resolved %s as protocol=%s transport=%s confidence=%s (detector=%s)", target, fp.Protocol, fp.Transport, fp.Confidence, fp.DetectorID)
-	return fp.Protocol
+	resolvedTarget = target
+	if fp.Candidate.URL != "" {
+		resolvedTarget = fp.Candidate.URL
+		rep.Target.URL = resolvedTarget // report what was actually scanned, not just what the user typed
+	}
+	verboseLog(opts, "discovery resolved %s as protocol=%s transport=%s confidence=%s endpoint=%s (detector=%s)", target, fp.Protocol, fp.Transport, fp.Confidence, resolvedTarget, fp.DetectorID)
+	return fp.Protocol, resolvedTarget
+}
+
+// runDiscovery assembles the registry and runs it against one candidate —
+// shared by both branches of resolveViaDiscovery (protocol-detection under
+// --protocol=auto, and endpoint-path resolution for a bare origin under a
+// fixed --protocol) so they don't each hand-roll the same two calls.
+func runDiscovery(ctx context.Context, candidate discovery.Candidate, opts *Options, stderr *os.File) *discovery.Fingerprint {
+	dreg := buildDiscoveryRegistry(opts, stderr)
+	return discovery.Run(ctx, dreg, candidate, discovery.DetectOptions{Timeout: opts.Timeout, AuthHeader: opts.AuthHeader})
+}
+
+// newSessionForTransport builds the probe.Session implementation matching
+// the transport discovery resolved (or "http-streamable", the static
+// --protocol=mcp default). This is the one place that decides which
+// concrete Session type a scan uses — every downstream consumer (probes,
+// mcp.InitializeSession) only ever sees the probe.Session interface.
+func newSessionForTransport(target, transport, authHeader string, timeout time.Duration) (probe.Session, error) {
+	switch transport {
+	case "http-sse-legacy":
+		return mcp.NewSSESession(target, authHeader, timeout), nil
+	case "websocket":
+		return mcp.NewWSSession(target, authHeader, timeout)
+	default: // "http-streamable", "", or anything unrecognized
+		return mcp.NewSession(target, authHeader, timeout), nil
+	}
 }
 
 // buildDiscoveryRegistry assembles the discovery.Registry from hand-written
@@ -286,10 +397,21 @@ func buildDiscoveryRegistry(opts *Options, stderr *os.File) *discovery.Registry 
 
 // scanSingleTarget handles a single target (backward compatible path)
 func scanSingleTarget(target string, opts *Options, reg *probe.Registry, stdout, stderr *os.File) int {
+	rep := runScan(target, opts, reg, stderr)
+	return writeReport(rep, opts, stdout, stderr)
+}
+
+// runScan performs the full discovery → fingerprint → enumerate → probe
+// pipeline for one target and returns the finished report. Both the
+// single-target and batch paths share this — they used to duplicate the
+// whole scan body, which is exactly the kind of place a fix (like the
+// confirmation-gating logic below) silently lands in only one of the two
+// copies.
+func runScan(target string, opts *Options, reg *probe.Registry, stderr *os.File) *report.Report {
 	verboseLog(opts, "scanning %s", target)
 	rep := &report.Report{
 		Tool:      "reap",
-		Version:   "0.1.0",
+		Version:   Version,
 		StartedAt: time.Now().UTC(),
 		Target:    report.Target{URL: target, Protocol: opts.Protocol},
 	}
@@ -297,34 +419,127 @@ func scanSingleTarget(target string, opts *Options, reg *probe.Registry, stdout,
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout*4)
 	defer cancel()
 
-	protocol := resolveViaDiscovery(ctx, target, opts, rep, stderr)
-	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
+	progress(opts, stderr, "discovery  %s", target)
+	protocol, resolvedTarget := resolveViaDiscovery(ctx, target, opts, rep, stderr)
+	if resolvedTarget != target {
+		progress(opts, stderr, "discovery  resolved endpoint %s", resolvedTarget)
+		verboseLog(opts, "discovery resolved endpoint %s -> %s", target, resolvedTarget)
+	}
+	if rep.Target.Transport == "" {
+		// Discovery wasn't asked to run (--protocol=mcp, the static
+		// default path) — the session below is always mcp.NewSession,
+		// i.e. streamable-HTTP, so record that instead of leaving
+		// Transport blank. No probe filtering changes as a result: every
+		// built-in probe already supports http-streamable.
+		rep.Target.Transport = "http-streamable"
+	}
 
-	init, _, err := sess.Initialize(ctx)
+	captureTargetFingerprint(ctx, resolvedTarget, rep, opts.Timeout)
+
+	progress(opts, stderr, "fingerprint  handshake (%s over %s)", protocol, rep.Target.Transport)
+	sess, err := newSessionForTransport(resolvedTarget, rep.Target.Transport, opts.AuthHeader, opts.Timeout)
 	if err != nil {
-		rep.AddError(fmt.Errorf("initialize handshake failed: %w", err))
-		verboseLog(opts, "initialize handshake failed: %v", err)
-	} else if init != nil {
+		rep.AddError(fmt.Errorf("establish %s session: %w", rep.Target.Transport, err))
+		rep.Target.Confirmed = false
+		rep.Target.ConfirmState = report.ConfirmStateUnconfirmed
+		rep.Target.ConfirmReason = fmt.Sprintf("could not establish a %s connection: %v", rep.Target.Transport, err)
+		rep.FinishedAt = time.Now().UTC()
+		return rep
+	}
+
+	init, initRaw, err := mcp.InitializeSession(ctx, sess)
+	if initRaw != nil && initRaw.Headers != nil {
+		// Captured regardless of handshake success — a CDN/edge Server
+		// header (e.g. "cloudflare") is a fact about what's fronting the
+		// target, not a security finding, and it's present on error
+		// responses too. Surfacing it in the fingerprint block up front
+		// (WriteHuman's "edge" line) reframes the rest of the report
+		// correctly: you're often probing the edge, not the origin.
+		rep.Target.EdgeServer = initRaw.Headers.Get("Server")
+	}
+
+	// A 401/403 on initialize is only a scan failure if the response looks
+	// nothing like MCP. If it's auth-gated but MCP-consistent (problem+json,
+	// a JSON-RPC error envelope, or a Bearer challenge), the target IS an
+	// MCP endpoint that requires credentials — that's confirmed, not an
+	// error. See mcp.ClassifyAuthGate.
+	isAuthStatus := initRaw != nil && (initRaw.StatusCode == http.StatusUnauthorized || initRaw.StatusCode == http.StatusForbidden)
+	var authGate mcp.AuthGateSignal
+	if err != nil && isAuthStatus {
+		authGate = mcp.ClassifyAuthGate(initRaw)
+	}
+
+	switch {
+	case err == nil && init != nil:
+		rep.Target.Confirmed = true
+		rep.Target.ConfirmState = report.ConfirmStateConfirmed
 		rep.Target.ServerName = init.ServerInfo.Name
 		rep.Target.ServerVer = init.ServerInfo.Version
 		rep.Target.ProtocolVer = init.ProtocolVersion
 		verboseLog(opts, "initialize handshake success: server=%s version=%s protocol=%s", init.ServerInfo.Name, init.ServerInfo.Version, init.ProtocolVersion)
+
+	case err != nil && isAuthStatus && authGate.Any():
+		// Auth gate is expected behavior for a protected MCP server, not a
+		// tool error — deliberately no rep.AddError and Confirmed stays true.
+		rep.Target.Confirmed = true
+		rep.Target.ConfirmState = report.ConfirmStateAuthGated
+		rep.Target.ConfirmReason = fmt.Sprintf("initialize requires auth: HTTP %d (%s)", initRaw.StatusCode, authGate.String())
+		verboseLog(opts, "initialize requires auth: HTTP %d (%s) — treating target as confirmed", initRaw.StatusCode, authGate.String())
+
+	case err != nil:
+		rep.AddError(fmt.Errorf("initialize handshake failed: %w", err))
+		rep.Target.Confirmed = false
+		rep.Target.ConfirmState = report.ConfirmStateUnconfirmed
+		rep.Target.ConfirmReason = fmt.Sprintf("%s initialize handshake failed: %v", protocol, err)
+		verboseLog(opts, "initialize handshake failed: %v", err)
 	}
 
-	probes := filterProbes(reg.ForProtocol(protocol), opts.Include, opts.Exclude)
-	verboseLog(opts, "running %d probes for %s", len(probes), target)
+	byProtocol := reg.ForProtocol(protocol)
+	byTransport := reg.ForProtocolAndTransport(protocol, rep.Target.Transport)
+	transportSkipped := len(byProtocol) - len(byTransport)
+	probes := filterProbes(byTransport, opts.Include, opts.Exclude)
+	progress(opts, stderr, "enumerate + probe  %d checks", len(probes))
+	perProbeCounts := make(map[string]int, len(probes))
 	for _, p := range probes {
 		verboseLog(opts, "running probe %s", p.ID())
+		before := len(rep.Findings)
 		if err := p.Run(ctx, sess, rep); err != nil {
 			rep.AddError(fmt.Errorf("probe %s: %w", p.ID(), err))
 			verboseLog(opts, "probe %s failed: %v", p.ID(), err)
 		} else {
 			verboseLog(opts, "probe %s completed", p.ID())
 		}
+		perProbeCounts[p.ID()] = len(rep.Findings) - before
 	}
+	rep.ComputeCoverage(perProbeCounts, transportSkipped)
+	rep.ApplyConfidenceDowngrade()
 	rep.FinishedAt = time.Now().UTC()
 
-	return writeReport(rep, opts, stdout, stderr)
+	return rep
+}
+
+// captureTargetFingerprint fills in the best-effort facts shown in the
+// report's fingerprint block (resolved IP, TLS summary) once up front,
+// regardless of whether any probe later turns them into a finding — a
+// scanner announcing what it found before it announces what's wrong is
+// table stakes (nmap does the same with its port/service map).
+func captureTargetFingerprint(ctx context.Context, target string, rep *report.Report, timeout time.Duration) {
+	u, err := url.Parse(target)
+	if err != nil || u.Hostname() == "" {
+		return
+	}
+	if ips, err := net.DefaultResolver.LookupHost(ctx, u.Hostname()); err == nil && len(ips) > 0 {
+		rep.Target.ResolvedIP = ips[0]
+	}
+	if u.Scheme == "https" {
+		if state, cert, err := common.InspectTLS(ctx, target); err == nil {
+			validity := "valid"
+			if time.Now().After(cert.NotAfter) || time.Now().Before(cert.NotBefore) {
+				validity = "invalid"
+			}
+			rep.Target.TLSSummary = fmt.Sprintf("%s · %s · %s", common.TLSVersionName(state.Version), validity, cert.Subject.CommonName)
+		}
+	}
 }
 
 // scanBatch handles multiple targets with concurrency
@@ -350,7 +565,7 @@ func scanBatch(targets []string, opts *Options, reg *probe.Registry, stdout, std
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				rep := scanTarget(job.target, opts, reg)
+				rep := runScan(job.target, opts, reg, os.Stderr)
 				mu.Lock()
 				results[job.idx] = rep
 				mu.Unlock()
@@ -370,49 +585,6 @@ func scanBatch(targets []string, opts *Options, reg *probe.Registry, stdout, std
 
 	// Write batch output
 	return writeBatchReport(results, opts, stdout, stderr)
-}
-
-// scanTarget scans a single target and returns its report
-func scanTarget(target string, opts *Options, reg *probe.Registry) *report.Report {
-	verboseLog(opts, "scanning %s", target)
-	rep := &report.Report{
-		Tool:      "reap",
-		Version:   "0.1.0",
-		StartedAt: time.Now().UTC(),
-		Target:    report.Target{URL: target, Protocol: opts.Protocol},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout*4)
-	defer cancel()
-
-	protocol := resolveViaDiscovery(ctx, target, opts, rep, os.Stderr)
-	sess := mcp.NewSession(target, opts.AuthHeader, opts.Timeout)
-
-	init, _, err := sess.Initialize(ctx)
-	if err != nil {
-		rep.AddError(fmt.Errorf("initialize handshake failed: %w", err))
-		verboseLog(opts, "initialize handshake failed: %v", err)
-	} else if init != nil {
-		rep.Target.ServerName = init.ServerInfo.Name
-		rep.Target.ServerVer = init.ServerInfo.Version
-		rep.Target.ProtocolVer = init.ProtocolVersion
-		verboseLog(opts, "initialize handshake success: server=%s version=%s protocol=%s", init.ServerInfo.Name, init.ServerInfo.Version, init.ProtocolVersion)
-	}
-
-	probes := filterProbes(reg.ForProtocol(protocol), opts.Include, opts.Exclude)
-	verboseLog(opts, "running %d probes for %s", len(probes), target)
-	for _, p := range probes {
-		verboseLog(opts, "running probe %s", p.ID())
-		if err := p.Run(ctx, sess, rep); err != nil {
-			rep.AddError(fmt.Errorf("probe %s: %w", p.ID(), err))
-			verboseLog(opts, "probe %s failed: %v", p.ID(), err)
-		} else {
-			verboseLog(opts, "probe %s completed", p.ID())
-		}
-	}
-	rep.FinishedAt = time.Now().UTC()
-
-	return rep
 }
 
 // writeBatchReport handles output for multiple targets
@@ -455,13 +627,12 @@ func writeBatchReport(reports []*report.Report, opts *Options, stdout, stderr *o
 	default:
 		// Human-readable: per-target header + report
 		for _, rep := range reports {
-			rep.WriteHuman(stdout)
+			rep.WriteHumanDossier(stdout, humanColorEnabled(opts.Color, stdout), opts.Verbose)
 		}
 	}
 
-	// Check for errors
 	for _, rep := range reports {
-		if len(rep.Errors) > 0 {
+		if exitCode(rep.Errors, rep.MeetsSeverity(report.Severity(opts.FailOn))) == 1 {
 			return 1
 		}
 	}
@@ -643,13 +814,21 @@ func writeReport(rep *report.Report, opts *Options, stdout, stderr *os.File) int
 			return 1
 		}
 	default:
-		rep.WriteHuman(w)
+		rep.WriteHumanDossier(w, humanColorEnabled(opts.Color, w), opts.Verbose)
 		if f != nil {
 			_ = rep.WriteJSON(f)
 		}
 	}
 
-	if len(rep.Errors) > 0 {
+	return exitCode(rep.Errors, rep.MeetsSeverity(report.Severity(opts.FailOn)))
+}
+
+// exitCode centralizes the two independent reasons a scan should fail a
+// pipeline: the run itself errored (handshake failure, etc — always
+// visible in CI regardless of --fail-on), or a finding met the configured
+// --fail-on severity threshold.
+func exitCode(errs []string, severityTripped bool) int {
+	if len(errs) > 0 || severityTripped {
 		return 1
 	}
 	return 0
@@ -679,6 +858,9 @@ func parseFlags(args []string) (*Options, *flag.FlagSet, error) {
 	fs.StringVar(&o.Exclude, "exclude", "", "comma-separated probe IDs to skip")
 	fs.BoolVar(&o.ListProbes, "list-probes", false, "list all registered probe IDs and exit")
 	fs.BoolVar(&o.Authorized, "authorized", false, "confirm you own or are explicitly authorized to test the target(s)")
+	fs.BoolVar(&o.Quiet, "quiet", false, "suppress banner and stage-progress lines on stderr")
+	fs.StringVar(&o.Color, "color", "auto", "colorize output: auto|always|never")
+	fs.StringVar(&o.FailOn, "fail-on", "none", "exit 1 on finding at/above severity: none|low|medium|high")
 
 	fs.Usage = func() {
 		PrintBanner(fs.Output())
@@ -693,6 +875,11 @@ func parseFlags(args []string) (*Options, *flag.FlagSet, error) {
 			return nil, fs, nil
 		}
 		return nil, fs, err
+	}
+	switch o.Color {
+	case "auto", "always", "never":
+	default:
+		return nil, fs, fmt.Errorf("invalid --color value %q: expected auto, always, or never", o.Color)
 	}
 	return o, fs, nil
 }

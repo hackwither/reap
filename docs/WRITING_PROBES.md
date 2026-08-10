@@ -34,8 +34,20 @@ Drop the file anywhere under `templates/` (subdirectories are fine — `template
 - **protocol** — which `Session` implementation this runs against. `"mcp"` today.
 - **info.severity** — one of `info`, `low`, `medium`, `high`. Recon findings are exposure signals, not confirmed exploits — keep severities honest; most things are `low`/`medium`, not `high`.
 - **info.asi_refs** — cite [OWASP ASI01–ASI10](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/) where genuinely applicable. Don't cite one just to look thorough.
+- **info.references** — optional list of the underlying standards this check is judged against, e.g. `["RFC 6750 (Bearer Token Usage)"]`. Shown alongside the ASI code in reports so a reader can see *why* the check exists, not just that it fired.
 - **request.no_auth** — if `true`, the request is sent with any configured `--auth-header` deliberately stripped, so you're explicitly testing the anonymous path.
 - **match_logic** — `"any"` (default, OR) or `"all"` (AND) across the matchers list.
+
+## Confidence and reproduction
+
+Every finding carries a `confidence` ("high"/"medium"/"low") and, where possible, a reproducible `request` (the exact method/URL/headers/body that triggered it, rendered in reports as an evidence block plus a `curl` one-liner). For **template-defined checks this is automatic** — a template only fires when its matchers actually matched, so its findings are always `confidence: "high"`, and the request/response that matched is captured for you; you don't need to do anything extra.
+
+If you're writing a **hand-written Go probe** instead (see below), set both explicitly on the `report.Finding` you build:
+
+- `Confidence`: `"high"` for a direct protocol-level observation (a header that's actually present, a status code that actually came back), `"medium"` for a heuristic (keyword matching, naming-convention pattern matching, absence-of-evidence signals like a missing rate-limit header).
+- `Request: &report.HTTPExchange{...}` populated from the `probe.RawResult` your probe already has in scope — `Method`, `URL`, `StatusCode`, `ContentType`, `BodySize`, and `Body` (the exact request body sent, if any — without it a `curl -X POST` repro can't actually reproduce a body-dependent match). Skip this field only when there genuinely isn't a single request/response the finding traces back to (e.g. a TLS-handshake-level observation, or a value like a session ID that was captured incidentally on an earlier, unrelated call).
+
+Also note: **when a target hasn't confirmed the protocol being scanned** (e.g. an MCP `initialize` handshake that returned HTML instead of JSON-RPC), `Report.ApplyConfidenceDowngrade` overrides all of this uniformly — every finding's severity is capped at `info` and confidence forced to `"low"`, regardless of what an individual probe or template set. This is deliberate: a scanner firing MED findings against a plain web server because a handshake failed is the credibility failure this whole mechanism exists to prevent. See `internal/report/report.go`.
 
 ## Matcher types
 

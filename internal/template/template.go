@@ -29,8 +29,13 @@ import (
 )
 
 type Template struct {
-	ID         string    `json:"id"`
-	Protocol   string    `json:"protocol"`
+	ID       string `json:"id"`
+	Protocol string `json:"protocol"`
+	// Transports lists which Session transports this template can run
+	// over; defaults to ["*"] (transport-agnostic — payload shape only)
+	// when omitted. Set explicitly for templates that depend on HTTP
+	// mechanics (response headers, status codes tied to HTTP semantics).
+	Transports []string  `json:"transports,omitempty"`
 	Info       Info      `json:"info"`
 	Request    Request   `json:"request"`
 	Matchers   []Matcher `json:"matchers"`
@@ -38,9 +43,18 @@ type Template struct {
 }
 
 type Info struct {
-	Title       string   `json:"title"`
-	Severity    string   `json:"severity"` // info|low|medium|high
-	ASIRefs     []string `json:"asi_refs,omitempty"`
+	Title      string   `json:"title"`
+	Severity   string   `json:"severity"` // info|low|medium|high
+	ASIRefs    []string `json:"asi_refs,omitempty"`
+	References []string `json:"references,omitempty"` // underlying standards this check is judged against, e.g. "RFC 6750 (Bearer Token Usage)"
+	// Confidence overrides the default "high" a matched template otherwise
+	// gets. A matcher firing is always high confidence about the fact it
+	// observed (a header was present, a status code was N) — but the
+	// *interpretation* a template's title/description draws from that fact
+	// can still be a heuristic (e.g. "Server: cloudflare" is high-confidence
+	// evidence of a CDN edge, but only medium-confidence evidence of
+	// anything about the origin application). Set this when the two diverge.
+	Confidence  string   `json:"confidence,omitempty"`
 	Description string   `json:"description"`
 	Remediation string   `json:"remediation,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
@@ -117,6 +131,12 @@ type templateProbe struct{ t *Template }
 
 func (p *templateProbe) ID() string       { return p.t.ID }
 func (p *templateProbe) Protocol() string { return p.t.Protocol }
+func (p *templateProbe) Transports() []string {
+	if len(p.t.Transports) == 0 {
+		return []string{"*"}
+	}
+	return p.t.Transports
+}
 
 func (p *templateProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	t := p.t
@@ -156,19 +176,56 @@ func (p *templateProbe) Run(ctx context.Context, s probe.Session, r *report.Repo
 		return nil
 	}
 
+	headers := make(map[string]string, len(t.Request.Headers))
+	for k, v := range t.Request.Headers {
+		headers[k] = v
+	}
+
+	confidence := t.Info.Confidence
+	if confidence == "" {
+		confidence = "high" // a JSON template only fires when its matchers actually matched — same default standard as a hand-written probe
+	}
+
 	r.AddFinding(report.Finding{
 		ID:          t.ID,
 		Title:       t.Info.Title,
 		Severity:    report.Severity(t.Info.Severity),
+		Confidence:  confidence,
 		Protocol:    t.Protocol,
 		ASI:         t.Info.ASIRefs,
+		References:  t.Info.References,
 		Description: t.Info.Description,
-		Evidence:    map[string]any{"matchers": matchEvidence, "status_code": raw.StatusCode},
+		Evidence:    map[string]any{"matchers": matchEvidence, "status_code": raw.StatusCode, "rpc_method": t.Request.Method},
+		Request: &report.HTTPExchange{
+			// Templates dispatch through probe.Session.Do, which always
+			// speaks JSON-RPC over an HTTP POST regardless of the
+			// underlying rpc_method — see mcp.Session.Do.
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Headers:     headers,
+			Body:        jsonRPCBody(t.Request.Method, t.Request.Params),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
 		Remediation: t.Info.Remediation,
 		Source:      "template:" + t.ID,
 		Tags:        t.Info.Tags,
 	})
 	return nil
+}
+
+// jsonRPCBody renders the exact JSON-RPC envelope a template's request
+// turns into on the wire, for the HTTPExchange repro line — matches the
+// shape probe.Session.Do's callers build (see mcp.Session.Do's rpcRequest),
+// with a fixed id since reproduction doesn't depend on which request number
+// this was in the session.
+func jsonRPCBody(method string, params any) string {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // EvalMatcher evaluates a single Matcher against a raw response, exported so

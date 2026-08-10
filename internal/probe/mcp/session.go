@@ -163,17 +163,28 @@ func extractSSEData(body []byte) ([]byte, error) {
 // This is called once by the CLI before probes run, so every probe can rely
 // on the session already being negotiated (or know clearly that it failed).
 func (s *Session) Initialize(ctx context.Context) (*InitializeResult, *probe.RawResult, error) {
-	params := map[string]any{
-		"protocolVersion": mcpProtocolVersion,
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "reap",
-			"version": "0.1.0",
-		},
-	}
-	raw, err := s.Do(ctx, "initialize", params)
+	return InitializeSession(ctx, s)
+}
+
+// InitializeSession performs the MCP handshake against any probe.Session
+// implementation — streamable-HTTP, legacy-SSE, WebSocket, or any future
+// transport. Every transport speaks the same JSON-RPC "initialize" method
+// once a Session exists, so the handshake logic itself doesn't need to be
+// transport-specific; only Session.Do's wire format differs underneath.
+func InitializeSession(ctx context.Context, sess probe.Session) (*InitializeResult, *probe.RawResult, error) {
+	raw, err := sess.Do(ctx, "initialize", initializeParams())
 	if err != nil {
 		return nil, raw, err
+	}
+	// A non-200 must never be treated as a successful handshake, even if
+	// the error body happens to be valid JSON. Without this check, a 401
+	// from some unrelated API (e.g. {"title":"Unauthorized",...}, no
+	// "result" or "error" key at all) decodes into an empty-but-error-free
+	// envelope below and gets reported as a confirmed MCP server with an
+	// empty serverInfo — a real false positive this exact shape produced
+	// against a live auth-gated MCP endpoint.
+	if raw.StatusCode != http.StatusOK {
+		return nil, raw, fmt.Errorf("server returned HTTP %d for initialize (expected 200)", raw.StatusCode)
 	}
 	var envelope struct {
 		Result InitializeResult `json:"result"`
@@ -184,6 +195,13 @@ func (s *Session) Initialize(ctx context.Context) (*InitializeResult, *probe.Raw
 	}
 	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
 		return nil, raw, fmt.Errorf("server returned JSON-RPC error: %s", rpcErrorMessage(envelope.Error))
+	}
+	// A 200 with a JSON body that has neither field is the same false-match
+	// risk as above, just with a 200 instead of a 401 — require the result
+	// to actually look like an MCP initialize result, not just "not an
+	// error."
+	if envelope.Result.ProtocolVersion == "" && envelope.Result.ServerInfo.Name == "" {
+		return nil, raw, fmt.Errorf("initialize response included neither protocolVersion nor serverInfo.name — doesn't look like a real MCP handshake result")
 	}
 	return &envelope.Result, raw, nil
 }

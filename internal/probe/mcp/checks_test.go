@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hackwither/reap/internal/probe"
 	"github.com/hackwither/reap/internal/report"
@@ -263,11 +264,85 @@ func TestOAuthMetadataPostureProbe(t *testing.T) {
 
 	rep := &report.Report{Tool: "reap", Version: "0.1.0", StartedAt: report.Report{}.StartedAt, Target: report.Target{URL: srv.URL, Protocol: "mcp"}}
 	probe := &oauthMetadataPostureProbe{}
-	if err := probe.Run(context.Background(), &Session{url: srv.URL}, rep); err != nil {
+	// NewSession, not a bare &Session{url: ...} literal: the probe now also
+	// checks for a Bearer challenge via a real s.Do call (RFC 9728 — see
+	// package comment on oauthMetadataPostureProbe), which needs a real
+	// http.Client under the hood.
+	sess := NewSession(srv.URL, "", 5*time.Second)
+	if err := probe.Run(context.Background(), sess, rep); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(rep.Findings) != 1 {
-		t.Fatalf("expected 1 finding, got %d", len(rep.Findings))
+		t.Fatalf("expected 1 finding (PKCE not advertised; no 401 observed so no bearer-challenge finding), got %d: %+v", len(rep.Findings), rep.Findings)
+	}
+	if rep.Findings[0].ID != "mcp-oauth-metadata-posture" {
+		t.Fatalf("expected the PKCE finding (mcp-oauth-metadata-posture), got %q", rep.Findings[0].ID)
+	}
+}
+
+// TestOAuthMetadataPostureProbe_404DoesNotClaimPublished is a regression
+// test for a real false positive: the probe used to treat ANY non-zero
+// HTTP status (including 404) from a .well-known path as "reachable," so it
+// reported "metadata published but missing PKCE" against a target that
+// never published metadata at all — a finding that contradicted its own
+// 404 evidence. Only a 200 with parseable JSON counts as "published."
+func TestOAuthMetadataPostureProbe_404DoesNotClaimPublished(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Both well-known paths 404 (nothing published). tools/list
+		// returns 401 WITH a correct Bearer challenge (healthy case), so
+		// the only remaining way this test could produce a finding is the
+		// bug this test guards against.
+		if r.Method == http.MethodPost {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	rep := &report.Report{Target: report.Target{URL: srv.URL, Protocol: "mcp"}}
+	probe := &oauthMetadataPostureProbe{}
+	sess := NewSession(srv.URL, "", 5*time.Second)
+	if err := probe.Run(context.Background(), sess, rep); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rep.Findings) != 0 {
+		t.Fatalf("expected no findings when metadata 404s and the Bearer challenge is present, got %d: %+v", len(rep.Findings), rep.Findings)
+	}
+}
+
+// TestOAuthMetadataPostureProbe_BearerCheckedOnProtectedResource is a
+// regression test for the second real bug: the Bearer challenge (RFC 9728)
+// must be read from the protected resource's own 401 (here, tools/list),
+// not from the .well-known metadata response's headers — checking the
+// wrong response means every correctly-configured server gets flagged.
+func TestOAuthMetadataPostureProbe_BearerCheckedOnProtectedResource(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// The protected resource's 401 has NO Bearer challenge — this
+			// must fire mcp-oauth-bearer-challenge-missing.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// The metadata document DOES advertise PKCE, and (pre-fix) also
+		// happened to carry an unrelated WWW-Authenticate header — proving
+		// the probe no longer reads Bearer status from here.
+		w.Header().Set("WWW-Authenticate", `Bearer realm="decoy, must not be read from here"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code_challenge_methods_supported":["S256"]}`))
+	}))
+	defer srv.Close()
+
+	rep := &report.Report{Target: report.Target{URL: srv.URL, Protocol: "mcp"}}
+	probe := &oauthMetadataPostureProbe{}
+	sess := NewSession(srv.URL, "", 5*time.Second)
+	if err := probe.Run(context.Background(), sess, rep); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rep.Findings) != 1 || rep.Findings[0].ID != "mcp-oauth-bearer-challenge-missing" {
+		t.Fatalf("expected exactly the bearer-challenge-missing finding, got %d: %+v", len(rep.Findings), rep.Findings)
 	}
 }
 
