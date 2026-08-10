@@ -38,24 +38,6 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 go install github.com/hackwither/reap/cmd/reap@latest
 ```
 
-Or pin a specific release:
-
-```sh
-go install github.com/hackwither/reap/cmd/reap@v0.1.0
-```
-
-Homebrew (macOS/Linux):
-
-```sh
-brew install --cask hackwither/tap/reap
-```
-
-Docker:
-
-```sh
-docker run --rm ghcr.io/hackwither/reap -t https://your-host/mcp --authorized
-```
-
 Or build from source:
 
 ```sh
