@@ -40,6 +40,7 @@ const (
 // frame's JSON-RPC id.
 type WSSession struct {
 	targetURL string
+	timeout   time.Duration
 	conn      net.Conn
 	writeMu   sync.Mutex
 
@@ -64,11 +65,18 @@ func NewWSSession(targetURL, authHeader string, timeout time.Duration) (*WSSessi
 	}
 	s := &WSSession{
 		targetURL: targetURL,
+		timeout:   timeout,
 		conn:      conn,
 		pending:   make(map[int]chan *probe.RawResult),
 	}
 	go s.runReader()
 	return s, nil
+}
+
+// AnonymousSession establishes a separate WebSocket handshake without auth.
+// WithNoAuth cannot change the credentials of an already-upgraded socket.
+func (s *WSSession) AnonymousSession() (probe.Session, error) {
+	return NewWSSession(s.targetURL, "", s.timeout)
 }
 
 func (s *WSSession) TargetURL() string { return s.targetURL }
