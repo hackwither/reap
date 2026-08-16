@@ -35,6 +35,7 @@ type rpcRequest struct {
 type Session struct {
 	url        string
 	httpClient *http.Client
+	timeout    time.Duration
 	authHeader string // e.g. "Bearer xyz", set via --auth-header; empty if none supplied
 	sessionID  string // captured from Mcp-Session-Id response header, if the server issues one
 	reqID      int
@@ -44,8 +45,17 @@ func NewSession(url, authHeader string, timeout time.Duration) *Session {
 	return &Session{
 		url:        url,
 		authHeader: authHeader,
+		timeout:    timeout,
 		httpClient: &http.Client{Timeout: timeout},
 	}
+}
+
+// AnonymousSession returns a fresh streamable-HTTP session with no
+// authentication or inherited MCP session ID. It is intentionally separate
+// from Do(WithNoAuth): an anonymous probe must not reuse authenticated
+// transport state.
+func (s *Session) AnonymousSession() (probe.Session, error) {
+	return NewSession(s.url, "", s.timeout), nil
 }
 
 func (s *Session) TargetURL() string { return s.url }

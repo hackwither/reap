@@ -152,3 +152,23 @@ func TestWSSession_MultipleSequentialRequests(t *testing.T) {
 		}
 	}
 }
+
+func TestWSSession_ClosePreventsFurtherRequests(t *testing.T) {
+	srv := wsEchoServer(t)
+	defer srv.Close()
+	wsURL := "ws" + srv.URL[len("http"):]
+
+	sess, err := NewWSSession(wsURL, "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewWSSession failed: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := sess.Do(ctx, "tools/list", map[string]any{}); err == nil {
+		t.Fatal("Do succeeded after Close")
+	}
+}

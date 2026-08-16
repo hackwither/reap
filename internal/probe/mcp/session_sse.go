@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,7 @@ import (
 type SSESession struct {
 	sseURL     string
 	authHeader string
+	timeout    time.Duration
 	httpClient *http.Client
 
 	connOnce sync.Once
@@ -39,6 +41,8 @@ type SSESession struct {
 	mu      sync.Mutex
 	postURL string
 	connErr error
+	closed  bool
+	cancel  context.CancelFunc
 	reqID   int
 	pending map[int]chan *probe.RawResult
 }
@@ -47,6 +51,7 @@ func NewSSESession(sseURL, authHeader string, timeout time.Duration) *SSESession
 	return &SSESession{
 		sseURL:     sseURL,
 		authHeader: authHeader,
+		timeout:    timeout,
 		// The GET stream is intentionally long-lived — per-request
 		// deadlines are enforced via the ctx each Do() call receives, not
 		// a client-wide timeout that would kill the SSE connection itself.
@@ -54,6 +59,28 @@ func NewSSESession(sseURL, authHeader string, timeout time.Duration) *SSESession
 		ready:      make(chan struct{}),
 		pending:    make(map[int]chan *probe.RawResult),
 	}
+}
+
+// AnonymousSession creates a new SSE stream and POST channel without auth.
+// The authenticated stream cannot be made anonymous after its handshake.
+func (s *SSESession) AnonymousSession() (probe.Session, error) {
+	return NewSSESession(s.sseURL, "", s.timeout), nil
+}
+
+// Close stops the persistent SSE stream. It is safe to call more than once.
+func (s *SSESession) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 func (s *SSESession) TargetURL() string { return s.sseURL }
@@ -64,7 +91,16 @@ func (s *SSESession) TargetURL() string { return s.sseURL }
 // first caller does any work, everyone else just waits on s.ready.
 func (s *SSESession) connect(ctx context.Context) error {
 	s.connOnce.Do(func() {
-		go s.runStream(ctx)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			s.failConnect(errors.New("SSE session is closed"))
+			return
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		s.cancel = cancel
+		s.mu.Unlock()
+		go s.runStream(streamCtx)
 	})
 	select {
 	case <-s.ready:

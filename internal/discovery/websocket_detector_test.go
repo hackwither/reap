@@ -49,6 +49,26 @@ func TestWebSocketDetector_MatchesConformantUpgrade(t *testing.T) {
 	}
 }
 
+func TestWebSocketDetector_MatchesHostPortCandidate(t *testing.T) {
+	srv := wsUpgradeServer()
+	defer srv.Close()
+
+	det := &mcpWebSocketDetector{}
+	fp, err := det.Detect(context.Background(), Candidate{
+		Kind: KindHostPort,
+		RawInput: srv.URL[len("http://"):],
+	}, DetectOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fp == nil {
+		t.Fatal("expected a fingerprint match against a host:port WS candidate, got nil")
+	}
+	if fp.Candidate.URL == "" {
+		t.Fatal("expected fingerprint to record the URL that upgraded")
+	}
+}
+
 // TestWebSocketDetector_NoFalsePositiveOnPlainHTTP is the false-positive
 // discipline check: a server that never upgrades at all must not match.
 func TestWebSocketDetector_NoFalsePositiveOnPlainHTTP(t *testing.T) {
