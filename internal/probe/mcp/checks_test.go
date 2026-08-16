@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
@@ -9,8 +10,63 @@ import (
 	"time"
 
 	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/probe/common"
 	"github.com/hackwither/reap/internal/report"
 )
+
+func authRequiredWSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		key := r.Header.Get("Sec-WebSocket-Key")
+		hj, _ := w.(http.Hijacker)
+		conn, buf, err := hj.Hijack()
+		if err != nil { return }
+		defer conn.Close()
+		buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + common.ExpectedWebSocketAccept(key) + "\r\n\r\n")
+		_ = buf.Flush()
+		reader := bufio.NewReader(buf)
+		for {
+			fin, opcode, payload, err := readWSFrame(reader)
+			if err != nil { return }
+			if !fin || opcode != wsOpText { continue }
+			var req struct { ID int `json:"id"`; Method string `json:"method"` }
+			if json.Unmarshal(payload, &req) != nil { continue }
+			result := map[string]any{}
+			switch req.Method {
+			case "initialize":
+				result = map[string]any{"protocolVersion": mcpProtocolVersion, "serverInfo": map[string]any{"name": "auth-ws"}, "capabilities": map[string]any{}}
+			case "tools/list":
+				result = map[string]any{"tools": []map[string]any{{"name": "secret_tool"}}}
+			}
+			resp, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+			if writeServerWSFrame(conn, wsOpText, resp) != nil { return }
+		}
+	}))
+}
+
+func TestUnauthToolsListProbeDoesNotReuseAuthenticatedWebSocket(t *testing.T) {
+	srv := authRequiredWSServer(t)
+	defer srv.Close()
+	wsURL := "ws" + srv.URL[len("http"):]
+	sess, err := NewWSSession(wsURL, "Bearer secret", 5*time.Second)
+	if err != nil { t.Fatalf("authenticated websocket handshake failed: %v", err) }
+	defer sess.conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	init, _, err := InitializeSession(ctx, sess)
+	if err != nil || init == nil { t.Fatalf("authenticated initialize failed: %v", err) }
+	raw, err := sess.Do(ctx, "tools/list", map[string]any{})
+	if err != nil || raw.StatusCode != http.StatusOK { t.Fatalf("authenticated tools/list failed: status=%d err=%v", raw.StatusCode, err) }
+
+	rep := &report.Report{Target: report.Target{URL: wsURL, Protocol: "mcp"}}
+	if err := (&unauthToolsListProbe{}).Run(ctx, sess, rep); err != nil { t.Fatalf("probe failed: %v", err) }
+	if len(rep.Findings) != 0 { t.Fatalf("authenticated websocket response was incorrectly reported as anonymous exposure: %+v", rep.Findings) }
+}
 
 type fakeSession struct {
 	responses map[string]*probe.RawResult

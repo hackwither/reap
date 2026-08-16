@@ -59,6 +59,18 @@ func reproBody(method string, params any) string {
 var httpOnlyTransports = []string{"http-streamable", "http-sse-legacy"}
 var anyTransport = []string{"*"}
 
+type anonymousSessionProvider interface {
+	AnonymousSession() (probe.Session, error)
+}
+
+func anonymousSession(s probe.Session) (probe.Session, error) {
+	provider, ok := s.(anonymousSessionProvider)
+	if !ok {
+		return nil, fmt.Errorf("session does not support a separate anonymous connection")
+	}
+	return provider.AnonymousSession()
+}
+
 // streamableHTTPOnly is for probes that depend on a mechanism specific to
 // the streamable-HTTP session implementation (e.g. the Mcp-Session-Id
 // response header it captures) that has no equivalent in legacy-SSE or
@@ -364,7 +376,11 @@ func (p *oauthMetadataPostureProbe) Transports() []string { return httpOnlyTrans
 //     signal that must not be reported as "published but incomplete."
 func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	// --- Bearer challenge: observed on the resource's own 401, not metadata. ---
-	unauthRaw, unauthErr := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	unauthSess, err := anonymousSession(s)
+	if err != nil {
+		return nil
+	}
+	unauthRaw, unauthErr := unauthSess.Do(ctx, "tools/list", map[string]any{})
 	sawChallenge := unauthErr == nil && unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
 	if sawChallenge {
 		wwwAuth := unauthRaw.Headers.Get("WWW-Authenticate")
@@ -731,10 +747,13 @@ func (p *unauthToolsListProbe) Protocol() string     { return "mcp" }
 func (p *unauthToolsListProbe) Transports() []string { return anyTransport }
 
 func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	// Re-issue tools/list explicitly WITHOUT the auth header, regardless of
-	// whether the initial handshake used one. This answers the specific
-	// question: "can an anonymous caller enumerate tools?"
-	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	// Use a fresh connection so no Authorization header, MCP session ID, or
+	// authenticated persistent transport state can affect this observation.
+	unauthSess, err := anonymousSession(s)
+	if err != nil {
+		return nil
+	}
+	raw, err := unauthSess.Do(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil // network failure is not a finding; leave silent, CLI logs errors separately
 	}
@@ -1085,8 +1104,12 @@ func (p *resourcesPromptsExposureProbe) Protocol() string     { return "mcp" }
 func (p *resourcesPromptsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
+	unauthSess, err := anonymousSession(s)
+	if err != nil {
+		return nil
+	}
 	for _, method := range []string{"resources/list", "prompts/list"} {
-		raw, err := s.Do(ctx, method, map[string]any{}, probe.WithNoAuth())
+		raw, err := unauthSess.Do(ctx, method, map[string]any{})
 		if err != nil || raw.StatusCode != 200 {
 			continue
 		}
