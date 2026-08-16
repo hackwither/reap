@@ -71,6 +71,15 @@ func anonymousSession(s probe.Session) (probe.Session, error) {
 	return provider.AnonymousSession()
 }
 
+// closeSession releases persistent transport state when a probe created a
+// separate anonymous session. Streamable HTTP sessions need no explicit
+// cleanup, while WebSocket and legacy-SSE sessions keep connections open.
+func closeSession(s probe.Session) {
+	if closer, ok := s.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
 // streamableHTTPOnly is for probes that depend on a mechanism specific to
 // the streamable-HTTP session implementation (e.g. the Mcp-Session-Id
 // response header it captures) that has no equivalent in legacy-SSE or
@@ -380,6 +389,7 @@ func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r 
 	if err != nil {
 		return nil
 	}
+	defer closeSession(unauthSess)
 	unauthRaw, unauthErr := unauthSess.Do(ctx, "tools/list", map[string]any{})
 	sawChallenge := unauthErr == nil && unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
 	if sawChallenge {
@@ -753,6 +763,7 @@ func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *repo
 	if err != nil {
 		return nil
 	}
+	defer closeSession(unauthSess)
 	raw, err := unauthSess.Do(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil // network failure is not a finding; leave silent, CLI logs errors separately
@@ -1108,6 +1119,7 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 	if err != nil {
 		return nil
 	}
+	defer closeSession(unauthSess)
 	for _, method := range []string{"resources/list", "prompts/list"} {
 		raw, err := unauthSess.Do(ctx, method, map[string]any{})
 		if err != nil || raw.StatusCode != 200 {
