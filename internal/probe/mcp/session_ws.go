@@ -79,6 +79,11 @@ func (s *WSSession) AnonymousSession() (probe.Session, error) {
 	return NewWSSession(s.targetURL, "", s.timeout)
 }
 
+// Close releases the upgraded connection and stops the background reader.
+func (s *WSSession) Close() error {
+	return s.conn.Close()
+}
+
 func (s *WSSession) TargetURL() string { return s.targetURL }
 
 // Do sends one JSON-RPC request as a text frame and waits for a response

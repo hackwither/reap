@@ -130,3 +130,39 @@ func TestSSESession_SynchronousPOSTResponsePreferred(t *testing.T) {
 		t.Fatalf("expected the synchronous POST response body to be used, got %s", raw.Body)
 	}
 }
+
+func TestSSESession_CloseStopsStream(t *testing.T) {
+	streamClosed := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: endpoint\ndata: /messages\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(streamClosed)
+	})
+	mux.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": body.ID, "result": map[string]any{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	sess := NewSSESession(srv.URL+"/sse", "", 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := sess.Do(ctx, "initialize", map[string]any{}); err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	select {
+	case <-streamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not stop the SSE stream")
+	}
+}
