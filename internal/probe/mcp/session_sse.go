@@ -31,6 +31,7 @@ import (
 type SSESession struct {
 	sseURL     string
 	authHeader string
+	timeout    time.Duration
 	httpClient *http.Client
 
 	connOnce sync.Once
@@ -47,6 +48,7 @@ func NewSSESession(sseURL, authHeader string, timeout time.Duration) *SSESession
 	return &SSESession{
 		sseURL:     sseURL,
 		authHeader: authHeader,
+		timeout:    timeout,
 		// The GET stream is intentionally long-lived — per-request
 		// deadlines are enforced via the ctx each Do() call receives, not
 		// a client-wide timeout that would kill the SSE connection itself.
@@ -54,6 +56,12 @@ func NewSSESession(sseURL, authHeader string, timeout time.Duration) *SSESession
 		ready:      make(chan struct{}),
 		pending:    make(map[int]chan *probe.RawResult),
 	}
+}
+
+// AnonymousSession creates a new SSE stream and POST channel without auth.
+// The authenticated stream cannot be made anonymous after its handshake.
+func (s *SSESession) AnonymousSession() (probe.Session, error) {
+	return NewSSESession(s.sseURL, "", s.timeout), nil
 }
 
 func (s *SSESession) TargetURL() string { return s.sseURL }
