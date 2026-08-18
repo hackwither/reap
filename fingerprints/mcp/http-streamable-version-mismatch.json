@@ -1,0 +1,22 @@
+{
+  "id": "mcp-http-streamable-version-mismatch",
+  "protocol": "mcp",
+  "transport": "http-streamable",
+  "kinds": ["url", "host-port"],
+  "paths": ["/", "/mcp", "/mcp/", "/sse", "/messages", "/rpc", "/api/mcp", "/v1/mcp", "/.well-known/mcp"],
+  "request": {
+    "http_method": "POST",
+    "rpc_method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": {},
+      "clientInfo": { "name": "reap", "version": "0.1.0" }
+    }
+  },
+  "matchers": [
+    { "type": "json_path", "path": "error.message", "any_of": ["protocol version", "protocolVersion", "unsupported protocol"], "value_contains": true }
+  ],
+  "match_logic": "all",
+  "on_match_confidence": "medium",
+  "comment": "A server that rejects reap's protocol version is still positively an MCP server. A declarative fingerprint cannot walk the version ladder the way mcp.Session.Initialize does, so this identifies the endpoint from the shape of its complaint instead. Without it, discovery reports nothing for any server pinned to an older spec revision."
+}

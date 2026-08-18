@@ -14,9 +14,9 @@
  <!-- <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release"> -->
 </p>
 
-**REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL you're authorized to test and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
+**REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL — or a bare `host:port` — that you're authorized to test, and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
 
-> **Use only against systems you own or are explicitly authorized to test.** REAP runs without `--authorized`, but you should only do that when you have permission. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
+> **Use only against systems you own or are explicitly authorized to test.** `--authorized` is an acknowledgement, not an access control: REAP still runs without it, and prints a warning. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
 
 ## Why REAP exists
 
@@ -24,31 +24,53 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 
 ## What makes it different
 
-**It reads, it never invokes** This is enforced architecturally, not by convention. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool. There is no code path in REAP that sends `tools/call`, on any transport, from any built-in probe or user-supplied template. A scanner that executes what it finds on an agent endpoint isn't a scanner, it's an agent. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
+**It reads, it never invokes** This is enforced architecturally, not by convention. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool — or even to send a notification. There is no code path in REAP that sends `tools/call`, on any transport, from any built-in probe or user-supplied template. A scanner that executes what it finds on an agent endpoint isn't a scanner, it's an agent. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
 
 **It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS. REAP checks the things that only make sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to.
 
-**It's built for pipelines and CI** Text for humans, NDJSON for pipelines, SARIF 2.1.0 for GitHub Advanced Security and every other code-scanning ingestion point. Single static Go binary, zero third-party dependencies, no API key, no telemetry, nothing leaves your machine except the requests you asked for.
+**Silence means something** Every probe records whether it ran, declined, errored, or was cut off, and the report carries a `status` of `complete` or `incomplete`. A target REAP couldn't reach never renders as a clean one.
 
-**It's designed to outlive MCP** MCP is the only supported protocol today, and it's the right first target. But the architecture (a protocol registry, per-protocol sessions, declarative checks) assumes there will be others.
+**It's built for pipelines and CI** Text for humans, NDJSON for pipelines, SARIF 2.1.0 for GitHub Advanced Security. `--fail-on` gates a build on severity; findings, usage errors, and incomplete scans each get their own exit code. Single static Go binary, zero third-party dependencies, no API key, no telemetry, nothing leaves your machine except the requests you asked for.
+
+**It's designed to outlive MCP** MCP is the only protocol with enumeration probes today. But every transport and TLS check is protocol-neutral, discovery already identifies A2A agent cards and OpenAPI services, and those targets get a real report — identification plus full transport posture — with no MCP involved.
 
 ## Install
 
-Build from source:
+Release binaries (Linux, macOS, Windows; amd64 and arm64) are attached to each [release](https://github.com/hackwither/reap/releases).
+
+```sh
+go install github.com/hackwither/reap/cmd/reap@latest
+```
+
+Docker:
+
+```sh
+docker run --rm ghcr.io/hackwither/reap -t https://your-host/mcp --authorized
+```
+
+From source:
 
 ```sh
 git clone https://github.com/hackwither/reap
 cd reap && go build -o bin/reap ./cmd/reap
 ```
 
-Requires Go 1.21+. No other dependencies.
+Requires Go 1.22+. No other dependencies.
+
+> `go install` places only the binary on your path. REAP loads templates and fingerprints from disk at startup, so point `--templates` and `--fingerprints` at a checkout, or use a release archive or the Docker image, both of which bundle them.
 
 ## Quick start
 
-Scan a single endpoint:
+Scan one endpoint:
 
 ```sh
 reap -t https://your-host/mcp --authorized
+```
+
+Give it a bare `host:port` and let discovery find the endpoint:
+
+```sh
+reap -t 10.0.0.7:8080 --authorized
 ```
 
 With credentials, to see what an authenticated caller gets:
@@ -57,10 +79,10 @@ With credentials, to see what an authenticated caller gets:
 reap -t https://your-host/mcp --auth-header "Bearer $TOKEN" --authorized
 ```
 
-Machine-readable, written to a file:
+Just identify what's there, without scanning:
 
 ```sh
-reap -t https://your-host/mcp --authorized --output json --out results/report.json
+reap -t 10.0.0.7:8080 --mode discover
 ```
 
 A whole scope list, concurrently, as NDJSON:
@@ -69,10 +91,16 @@ A whole scope list, concurrently, as NDJSON:
 cat scope.txt | reap --authorized --output json --concurrency 10
 ```
 
-In CI, as SARIF:
+Through Burp, for manual follow-up:
 
 ```sh
-reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif
+reap -t https://your-host/mcp --authorized --proxy http://127.0.0.1:8080
+```
+
+In CI, as SARIF, failing the build on anything high:
+
+```sh
+reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif --fail-on high
 ```
 
 ```yaml
@@ -83,16 +111,46 @@ reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif
     sarif_file: reap.sarif
 ```
 
+## Output
+
+The identification block comes first. REAP is a recon tool, so what the endpoint *is* leads, and posture findings follow.
+
+```
+reap report — http://10.0.0.7:8080/mcp
+  input:      10.0.0.7:8080 (resolved by discovery)
+  protocol:   mcp 2025-03-26
+  transport:  http-streamable
+  server:     internal-gateway 0.9.0
+  auth:       open (capability enumeration answered without credentials)
+  surface:    23 tools, 4 resources, 0 prompts
+  discovery:  mcp-http-streamable (confidence: high)
+  duration:   412ms
+  probes:     12 ran, 4 not-applicable
+
+  [HIGH]  MCP tool listing accessible without authentication (ASI02, ASI03)
+  ...
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Scan ran; nothing at or above `--fail-on` |
+| `1` | Findings at or above `--fail-on` (unset means never) |
+| `2` | Usage or validation error |
+| `3` | Scan could not complete — findings are not a negative result |
+
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10).
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10); see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does.
 
-### Capability surface: what is this endpoint willing to tell a stranger?
+### Recon: what is this endpoint, and what will it tell a stranger?
 
 | Check | What it finds |
 |---|---|
+| `mcp-auth-posture` | Whether enumeration is open, auth-gated, or unreachable; emits `mcp-enumeration-blocked` when gated |
+| `mcp-tool-capability-surface` | Full reported tool inventory, paginated, for asset tracking and cross-run diffing |
 | `mcp-unauth-tools-list` | `tools/list` answering to unauthenticated callers |
-| `mcp-tool-capability-surface` | Full reported tool inventory, for asset tracking and cross-run diffing |
 | `mcp-resources-prompts-exposure` | Unauthenticated `resources/list` and `prompts/list` |
 | `mcp-dynamic-dispatch` | Dispatch/search tool patterns implying a hidden capability surface larger than `tools/list` reports |
 | `mcp-instructions-exposure` | Handshake `instructions` leaking operator prompt material |
@@ -101,22 +159,37 @@ Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10).
 
 | Check | What it finds |
 |---|---|
-| `mcp-oauth-metadata-posture` | OAuth metadata endpoints missing Bearer challenge or PKCE advertisement |
+| `mcp-oauth-metadata-posture` | OAuth metadata not advertising PKCE |
+| `mcp-oauth-bearer-challenge-missing` | A 401 with no `WWW-Authenticate: Bearer`, so clients can't discover where to authenticate |
 | `mcp-redirect-uri-laxity` | Overly broad or wildcard OAuth redirect URI registration |
-| `mcp-session-id-entropy` | Weak or predictable session identifiers |
-| `mcp-host-header-validation` | Servers not validating `Host` during `initialize` |
+| `mcp-session-id-entropy` | Weak or predictable session identifiers (the value itself is never recorded) |
+| `mcp-host-header-validation` | Servers not validating `Host` during `initialize` (DNS rebinding) |
 
-### Transport posture
+### Transport posture — runs against every protocol
+
+These report `protocol=*` and apply to any endpoint REAP can identify, including ones with no enumeration probes yet.
 
 | Check | What it finds |
 |---|---|
-| `mcp-plaintext-transport` | Endpoints served over plaintext HTTP |
-| `mcp-transport-downgrade` | The same host also accepting MCP traffic in the clear |
-| `mcp-tls-cert-health` | Certificate validity, hostname mismatch, weak protocol and cipher selection |
-| `mcp-cors-wildcard` | Wildcard CORS, and wildcard combined with credentialed cross-origin access |
-| `mcp-rate-limit-absence` | Missing standard rate-limit headers on successful responses |
+| `transport-plaintext` | Endpoints served over plaintext HTTP |
+| `transport-downgrade` | The same host also accepting agent traffic in the clear |
+| `tls-cert-health` | Certificate validity, hostname mismatch, weak protocol and cipher selection |
+| `http-cors-wildcard` | Wildcard or reflected CORS, via a real preflight, and wildcard combined with credentials |
+| `http-rate-limit-absence` | Missing standard rate-limit headers |
 
-`reap --list-probes` prints the live set. Select with `--include` / `--exclude`.
+`reap --list-probes` prints the live set. Select with `--include` / `--exclude`; an unknown ID is a usage error rather than a silent no-op.
+
+## Protocol support
+
+| Protocol | Discovery | Enumeration | Transport posture |
+|---|---|---|---|
+| MCP (streamable HTTP) | yes | yes | yes |
+| MCP (legacy HTTP+SSE) | yes | — | yes |
+| MCP (WebSocket, non-standard) | yes | — | yes |
+| A2A (agent card) | yes | — | yes |
+| OpenAPI / REST tool surface | yes | — | yes |
+
+REAP negotiates MCP protocol versions `2025-06-18`, `2025-03-26`, and `2024-11-05`, sends the spec-required `notifications/initialized`, and carries the `MCP-Protocol-Version` header on post-handshake requests.
 
 ## Writing your own checks
 
@@ -126,29 +199,39 @@ Drop a JSON template in `templates/`, no Go, no rebuild:
 {
   "id": "mcp-custom-header-leak",
   "protocol": "mcp",
-  "severity": "medium",
+  "info": { "title": "Internal service header exposed", "severity": "medium" },
   "request": { "method": "tools/list" },
-  "matchers": {
-    "condition": "all",
-    "rules": [
-      { "type": "status_code", "values": [200] },
-      { "type": "header", "name": "X-Internal-Service", "present": true }
-    ]
-  }
+  "match_logic": "all",
+  "matchers": [
+    { "type": "status_code", "equals": 200 },
+    { "type": "header", "header": "X-Internal-Service" }
+  ]
 }
 ```
 
-Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` / `all`.
+Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` / `all`. Discovery fingerprints in `fingerprints/` use the same matcher vocabulary to identify protocols — see [`docs/WRITING_PROBES.md`](docs/WRITING_PROBES.md).
 
-A template deliberately **cannot** chain requests, branch on response data, or invoke a discovered tool. The first two are a roadmap item. The third never will be. If your check needs real logic, write a Go probe in `internal/probe/<protocol>/checks.go`, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+A template deliberately **cannot** chain requests, branch on response data, or invoke a discovered tool. The first two are a roadmap item. The third never will be. If your check needs real logic, write a Go probe, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Testing against a local range
+
+```sh
+python3 scripts/mock_mcp_server.py &          # permissive: lights up most probes
+reap -t http://127.0.0.1:8765/mcp --authorized
+
+python3 scripts/strict_mcp_server.py &        # pedantic: old spec revision, paginated, strict handshake
+reap -t http://127.0.0.1:8099/mcp --authorized
+```
+
+The strict fixture is the more useful of the two — it only answers a client that negotiates protocol versions, sends `notifications/initialized`, carries the protocol header, and follows `nextCursor`.
 
 ## Roadmap
 
-Planned, not yet shipped:
-
-- **Additional transports**: legacy HTTP+SSE, stdio, WebSocket, behind the same `Session` interface and the same no-invoke boundary.
+- **A2A and OpenAPI enumeration**: discovery and transport posture work today; skill/operation enumeration doesn't exist yet.
+- **Baseline diffing**: compare a scan against a stored previous run to surface capability-surface drift.
+- **Tag-based selection**: `--tags` alongside `--include`, once probes carry tags rather than only findings.
 - **Bounded range discovery**: sweep an operator-supplied host and port list for agent endpoints.
-- **More protocols**: A2A, and whatever else reaches deployment scale.
+- **stdio transport**: for locally-launched MCP servers, behind the same `Session` interface and no-invoke boundary.
 
 Issues and PRs welcome on any of these.
 

@@ -1,0 +1,29 @@
+{
+  "id": "openapi-spec",
+  "protocol": "openapi",
+  "transport": "http-rest",
+  "kinds": ["url", "host-port"],
+  "paths": [
+    "/openapi.json",
+    "/swagger.json",
+    "/.well-known/openapi.json",
+    "/v1/openapi.json",
+    "/api/openapi.json"
+  ],
+  "request": {
+    "http_method": "GET",
+    "headers": { "Accept": "application/json" }
+  },
+  "matchers": [
+    { "type": "json_path", "path": "openapi", "min_count": 1 },
+    { "type": "json_path", "path": "swagger", "min_count": 1 }
+  ],
+  "match_logic": "any",
+  "on_match_confidence": "high",
+  "extract": {
+    "server_name": "info.title",
+    "server_ver": "info.version",
+    "protocol_ver": "openapi"
+  },
+  "comment": "A tool-calling surface exposed as a REST spec is the other common shape an agent endpoint takes. Detection only, for the same reason as the A2A card: identification plus full transport posture, without any protocol-specific probe."
+}

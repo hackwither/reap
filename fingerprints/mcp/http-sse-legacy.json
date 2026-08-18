@@ -3,6 +3,7 @@
   "protocol": "mcp",
   "transport": "http-sse-legacy",
   "kinds": ["url", "host-port"],
+  "paths": ["/sse", "/", "/mcp", "/messages", "/events"],
   "request": {
     "http_method": "GET",
     "headers": { "Accept": "text/event-stream" }

@@ -10,7 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
+
+	"github.com/hackwither/reap/internal/httpx"
 )
 
 type PlaintextFallback struct {
@@ -19,7 +20,13 @@ type PlaintextFallback struct {
 	ContentType string `json:"content_type"`
 }
 
-func InspectTLS(ctx context.Context, target string) (*tls.ConnectionState, *x509.Certificate, error) {
+// InspectTLS completes a handshake purely to read the certificate and
+// negotiated parameters.
+//
+// Verification is deliberately skipped here regardless of --insecure: the
+// whole point is to report on certificates that would fail verification, and
+// refusing to connect would mean never producing that finding.
+func InspectTLS(ctx context.Context, client *httpx.Client, target string) (*tls.ConnectionState, *x509.Certificate, error) {
 	u, err := url.Parse(target)
 	if err != nil {
 		return nil, nil, err
@@ -33,14 +40,17 @@ func InspectTLS(ctx context.Context, target string) (*tls.ConnectionState, *x509
 		host = net.JoinHostPort(u.Hostname(), "443")
 	}
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{InsecureSkipVerify: true, ServerName: u.Hostname()})
+	conn, err := client.DialTLS(ctx, host, u.Hostname(), true)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer conn.Close()
 
-	state := conn.ConnectionState()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil, nil, fmt.Errorf("expected a TLS connection to %s", host)
+	}
+	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return nil, nil, fmt.Errorf("no peer certificate")
 	}
@@ -106,7 +116,7 @@ func IsCORSWildcard(headers http.Header) (bool, bool) {
 	return true, strings.EqualFold(acac, "true")
 }
 
-func DetectPlaintextListeners(ctx context.Context, targetURL string, paths []string) ([]PlaintextFallback, error) {
+func DetectPlaintextListeners(ctx context.Context, client *httpx.Client, targetURL string, paths []string) ([]PlaintextFallback, error) {
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
@@ -115,9 +125,7 @@ func DetectPlaintextListeners(ctx context.Context, targetURL string, paths []str
 		return nil, nil
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	results := []PlaintextFallback{}
-
 	for _, pth := range paths {
 		path := pth
 		if path == "" {
@@ -126,16 +134,21 @@ func DetectPlaintextListeners(ctx context.Context, targetURL string, paths []str
 		httpURL := *u
 		httpURL.Scheme = "http"
 		httpURL.Path = path
+		// An https target on an explicit port rarely serves plaintext on that
+		// same port; strip it so the sweep checks the conventional http port.
+		if httpURL.Port() == "443" {
+			httpURL.Host = httpURL.Hostname()
+		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpURL.String(), nil)
 		if err != nil {
 			continue
 		}
-		resp, err := client.Do(req)
+		resp, err := client.HTTP().Do(req)
 		if err != nil || resp == nil {
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
 		contentType := resp.Header.Get("Content-Type")
 		if resp.StatusCode == http.StatusOK || strings.Contains(strings.ToLower(contentType), "event-stream") {
@@ -144,9 +157,6 @@ func DetectPlaintextListeners(ctx context.Context, targetURL string, paths []str
 				StatusCode:  resp.StatusCode,
 				ContentType: contentType,
 			})
-			if strings.Contains(strings.ToLower(string(body)), "jsonrpc") {
-				results[len(results)-1].ContentType = contentType
-			}
 		}
 	}
 	return results, nil

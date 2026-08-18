@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -60,12 +59,15 @@ func (d *mcpWebSocketDetector) Detect(ctx context.Context, c Candidate, opts Det
 	}
 	addr := net.JoinHostPort(host, port)
 
-	dialer := &net.Dialer{Timeout: opts.Timeout}
+	client, err := clientFor(opts)
+	if err != nil {
+		return nil, err
+	}
 	var conn net.Conn
 	if tlsMode {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: host})
+		conn, err = client.DialTLS(ctx, addr, host, false)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+		conn, err = client.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return nil, nil // unreachable candidate is not a Detector failure

@@ -13,6 +13,8 @@ package discovery
 import (
 	"context"
 	"time"
+
+	"github.com/hackwither/reap/internal/httpx"
 )
 
 type CandidateKind string
@@ -50,11 +52,13 @@ type Fingerprint struct {
 }
 
 // DetectOptions carries the same cross-cutting knobs probe.Probe already has
-// (timeout, auth header) so Detectors don't need their own parallel config
-// surface.
+// so Detectors don't need their own parallel config surface. Client is shared
+// with the scan pipeline, so --proxy, --insecure, --user-agent and the rate
+// limit apply to discovery too.
 type DetectOptions struct {
 	Timeout    time.Duration
 	AuthHeader string
+	Client     *httpx.Client
 }
 
 // Detector is one self-contained "does this candidate look like protocol X

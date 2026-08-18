@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # CONTRIBUTING.md tells contributors this must print nothing, so it is
+      # enforced rather than suggested.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # The suite is hermetic: every network test binds httptest on loopback.
+      # -race matters because a batch scan runs probes across goroutines that
+      # share one httpx client and rate limiter.
+      - name: test
+        run: go test -race ./...
+
+  # A scan against the bundled ranges is the only check that exercises the real
+  # binary end to end. Both fixtures exist because bugs that were invisible
+  # against a lenient server were obvious against a strict one.
+  range-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: build
+        run: go build -o bin/reap ./cmd/reap
+
+      - name: scan the permissive fixture
+        run: |
+          python3 scripts/mock_mcp_server.py &
+          sleep 2
+          ./bin/reap -t http://127.0.0.1:8765/mcp --authorized --no-banner --output json --out mock.json
+          python3 - <<'PY'
+          import json, sys
+          rep = json.load(open("mock.json"))
+          assert rep["status"] == "complete", rep.get("incomplete_reason")
+          assert rep["target"]["auth_state"] == "open", rep["target"]
+          ids = {f["id"] for f in rep["findings"]}
+          for want in {"mcp-unauth-tools-list", "transport-plaintext"}:
+              assert want in ids, f"missing {want}: {sorted(ids)}"
+          print(f"ok: {len(ids)} finding ids")
+          PY
+
+      - name: scan the spec-strict fixture
+        run: |
+          python3 scripts/strict_mcp_server.py --port 8099 &
+          sleep 2
+          ./bin/reap -t http://127.0.0.1:8099/mcp --authorized --no-banner --output json --out strict.json
+          python3 - <<'PY'
+          import json
+          rep = json.load(open("strict.json"))
+          t = rep["target"]
+          # Version negotiation: the fixture refuses reap's newest revision.
+          assert t["protocol_version"] == "2025-03-26", t
+          # Pagination: 5 tools on page one, 1 on page two.
+          assert t["capabilities"]["tools"] == 6, t["capabilities"]
+          assert rep["status"] == "complete", rep.get("incomplete_reason")
+          print("ok: negotiated", t["protocol_version"], "with", t["capabilities"]["tools"], "tools")
+          PY
+
+      # An unreachable target must never look like a clean one.
+      - name: unreachable target reports incomplete
+        run: |
+          set +e
+          ./bin/reap -t http://127.0.0.1:9/mcp --authorized --no-banner --protocol mcp --output json --out dead.json
+          code=$?
+          set -e
+          if [ "$code" != "3" ]; then echo "expected exit 3, got $code"; exit 1; fi
+          python3 -c "
+          import json
+          rep = json.load(open('dead.json'))
+          assert rep['status'] == 'incomplete', rep
+          assert rep['target']['auth_state'] == 'unreached', rep['target']
+          print('ok: exit 3, status incomplete')
+          "

@@ -1,0 +1,27 @@
+{
+  "id": "a2a-agent-card",
+  "protocol": "a2a",
+  "transport": "http-json",
+  "kinds": ["url", "host-port"],
+  "paths": [
+    "/.well-known/agent-card.json",
+    "/.well-known/agent.json"
+  ],
+  "request": {
+    "http_method": "GET",
+    "headers": { "Accept": "application/json" }
+  },
+  "matchers": [
+    { "type": "status_code", "equals": 200 },
+    { "type": "json_path", "path": "name", "min_count": 1 },
+    { "type": "json_path", "path": "url", "min_count": 1 }
+  ],
+  "match_logic": "all",
+  "on_match_confidence": "high",
+  "extract": {
+    "server_name": "name",
+    "server_ver": "version",
+    "protocol_ver": "protocolVersion"
+  },
+  "comment": "Detection only. reap has no A2A enumeration probes yet, but identifying the agent card means the protocol-neutral transport checks (TLS, plaintext, downgrade, CORS, rate-limit headers) run against the endpoint and produce a real report."
+}

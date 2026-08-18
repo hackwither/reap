@@ -1,0 +1,60 @@
+version: 2
+
+project_name: reap
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: reap
+    main: ./cmd/reap
+    binary: reap
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+    # reap's version lives in internal/version as a plain const so the binary
+    # reports the same string whether it was built by goreleaser, `go install`,
+    # or `make build`. Nothing is stamped at link time on purpose.
+
+archives:
+  - id: reap
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "reap_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Templates and fingerprints are data reap loads at runtime, so an archive
+    # without them is only half a tool.
+    files:
+      - README.md
+      - LICENSE
+      - SECURITY.md
+      - templates/**/*
+      - fingerprints/**/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Verifying a download
+
+    ```sh
+    sha256sum -c checksums.txt --ignore-missing
+    ```
+
+    Only scan endpoints you own or are explicitly authorized to test. See SECURITY.md.

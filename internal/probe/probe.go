@@ -11,11 +11,38 @@ package probe
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/hackwither/reap/internal/report"
 )
+
+// ErrNotApplicable is the sentinel a Probe returns when it correctly declined
+// to run: a TLS check against an http:// target, a session-ID check where the
+// server issues no session ID, an MCP check on a target that never
+// handshook.
+//
+// This exists to close reap's worst evidence-integrity gap. Probes used to
+// "return nil" both when they found nothing and when they couldn't look,
+// which made a silent report indistinguishable from a clean one. A probe must
+// now say which it was: nil (ran, nothing found), ErrNotApplicable (declined),
+// or a real error (could not complete).
+var ErrNotApplicable = errors.New("probe not applicable to this target")
+
+// NotApplicable wraps a reason as an ErrNotApplicable, so the report can
+// record why a probe declined rather than just that it did.
+func NotApplicable(format string, args ...any) error {
+	return &notApplicableError{msg: fmt.Sprintf(format, args...)}
+}
+
+type notApplicableError struct{ msg string }
+
+func (e *notApplicableError) Error() string { return e.msg }
+func (e *notApplicableError) Is(target error) bool {
+	return target == ErrNotApplicable
+}
 
 // Session is the sandboxed handle a Probe gets. It deliberately does NOT
 // expose a generic "invoke any tool with any args" method — only the

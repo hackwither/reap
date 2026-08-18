@@ -3,6 +3,7 @@
   "protocol": "mcp",
   "transport": "http-streamable",
   "kinds": ["url", "host-port"],
+  "paths": ["/", "/mcp", "/mcp/", "/sse", "/messages", "/rpc", "/api/mcp", "/v1/mcp", "/.well-known/mcp"],
   "request": {
     "http_method": "POST",
     "rpc_method": "initialize",

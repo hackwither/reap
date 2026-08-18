@@ -24,8 +24,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hackwither/reap/internal/httpx"
 	"github.com/hackwither/reap/internal/probe"
 	"github.com/hackwither/reap/internal/template"
+	"github.com/hackwither/reap/internal/version"
 )
 
 // FPRequest describes the single raw HTTP request a fingerprint sends.
@@ -193,9 +195,13 @@ func (t *FingerprintTemplate) candidateURLs(c Candidate) []string {
 		if base == "" {
 			return nil
 		}
+		// A fingerprint that doesn't name its own paths used to inherit
+		// MCPWellKnownPaths, which silently gave every non-MCP fingerprint a
+		// set of MCP-specific paths to sweep. Protocol-specific paths belong
+		// in the fingerprint that needs them.
 		paths := t.Paths
 		if len(paths) == 0 {
-			paths = MCPWellKnownPaths
+			paths = []string{"/"}
 		}
 		var urls []string
 		for _, scheme := range []string{"https", "http"} {
@@ -207,6 +213,15 @@ func (t *FingerprintTemplate) candidateURLs(c Candidate) []string {
 	default:
 		return nil
 	}
+}
+
+// clientFor returns the shared client, falling back to a config-only client
+// for callers (chiefly tests) that build DetectOptions by hand.
+func clientFor(opts DetectOptions) (*httpx.Client, error) {
+	if opts.Client != nil {
+		return opts.Client, nil
+	}
+	return httpx.New(httpx.Config{Timeout: opts.Timeout}, version.UserAgent)
 }
 
 func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts DetectOptions) (*probe.RawResult, error) {
@@ -248,9 +263,12 @@ func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts D
 		httpReq.Header.Set("Authorization", opts.AuthHeader)
 	}
 
-	client := &http.Client{Timeout: opts.Timeout}
+	client, err := clientFor(opts)
+	if err != nil {
+		return nil, err
+	}
 	start := time.Now()
-	resp, err := client.Do(httpReq)
+	resp, err := client.HTTP().Do(httpReq)
 	latency := time.Since(start)
 	if err != nil {
 		return nil, err
