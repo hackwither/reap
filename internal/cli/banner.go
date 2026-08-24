@@ -8,10 +8,14 @@ import (
 )
 
 // Version is re-exported from internal/version so existing callers and tests
-// keep working. internal/version is the single source of truth — the const
-// can't live here because internal/probe/mcp needs it too and cli already
-// imports mcp.
-const Version = version.Version
+// keep working.
+//
+// internal/version is the single source of truth, including the
+// ldflags/build-info resolution chain. The value can't live here because
+// internal/probe/mcp and internal/report both need it and cli already imports
+// mcp — so release builds must stamp
+// -X github.com/hackwither/reap/internal/version.Version, not this package.
+func Version() string { return version.Version }
 
 const asciiArt = `
  ██▀███  ▓█████ ▄▄▄       ██▓███
@@ -31,5 +35,5 @@ func PrintBanner(w io.Writer) {
 	fmt.Fprint(w, asciiArt)
 	// Reuse the package-level banner constant defined in cli.go
 	fmt.Fprint(w, banner)
-	fmt.Fprintf(w, "\n        Reconnaissance and Enumeration for Agent Protocols\n                        by @hackwither\n                            v%s\n\n", Version)
+	fmt.Fprintf(w, "\n        Reconnaissance and Enumeration for Agent Protocols\n                        by @hackwither\n                            v%s\n\n", version.Version)
 }

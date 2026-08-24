@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/hackwither/reap/internal/probe"
@@ -19,10 +21,10 @@ import (
 // BuiltinProbes returns every MCP-specific probe.
 //
 // Transport-level checks (TLS health, plaintext, downgrade, CORS, rate-limit
-// headers) used to live here with mcp- IDs even though none of them look at a
-// single byte of MCP. They now live in internal/probe/transport with
-// Protocol() == "*", so they apply to any protocol reap can identify. See
-// docs/ARCHITECTURE.md.
+// headers) used to live here with mcp- IDs even though none of them read a
+// byte of MCP. They now live in internal/probe/transport with
+// Protocol() == "*", so they apply to every protocol reap can identify —
+// including A2A and OpenAPI, which have no enumeration probes yet.
 func BuiltinProbes() []probe.Probe {
 	return []probe.Probe{
 		&authPostureProbe{},
@@ -30,280 +32,57 @@ func BuiltinProbes() []probe.Probe {
 		&toolCapabilitySurfaceProbe{},
 		&hostHeaderValidationProbe{},
 		&oauthMetadataPostureProbe{},
-		&oauthBearerChallengeProbe{},
 		&redirectUriLaxityProbe{},
 		&sessionIDEntropyProbe{},
 		&instructionsExposureProbe{},
 		&resourcesPromptsExposureProbe{},
 		&dynamicDispatchProbe{},
+		&serverHeaderFingerprintProbe{},
 	}
 }
 
-func asSession(s probe.Session) (*Session, error) {
-	ms, ok := s.(*Session)
-	if !ok {
-		return nil, probe.NotApplicable("probe requires an MCP session, got %T", s)
-	}
-	return ms, nil
-}
-
-// IsAuthGated reports whether a raw response is the server declining for lack
-// of credentials rather than failing.
-//
-// The CLI uses this to decide whether a failed handshake belongs in the
-// report's error list. An auth-gated endpoint is a successful recon result,
-// not a tool failure, and must not make the process exit nonzero.
-func IsAuthGated(raw *probe.RawResult) bool {
-	if raw == nil {
-		return false
-	}
-	var envelope struct {
-		Error *rpcError `json:"error"`
-	}
-	_ = json.Unmarshal(raw.Body, &envelope)
-	return isAuthRejection(raw.StatusCode, envelope.Error)
-}
-
-// isAuthRejection reports whether a response is the server declining for lack
-// of credentials, as opposed to any other failure. Both the HTTP status and
-// the JSON-RPC error are checked because MCP servers signal this either way.
-func isAuthRejection(status int, rpcErr *rpcError) bool {
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return true
-	}
-	if rpcErr == nil {
-		return false
-	}
-	m := strings.ToLower(rpcErr.Message)
-	for _, hint := range []string{"unauthorized", "unauthenticated", "authentication", "auth required", "forbidden", "access denied", "permission", "invalid token", "missing token", "api key"} {
-		if strings.Contains(m, hint) {
-			return true
-		}
-	}
-	return false
-}
-
-// --- auth-posture -------------------------------------------------------
-
-// authPostureProbe establishes the single most useful recon fact about an
-// agent endpoint: does capability enumeration answer a stranger, does it
-// require credentials, or does it not answer at all?
-//
-// This used to be implicit. An auth-gated endpoint produced an "initialize
-// handshake failed" entry in the report's error list and a nonzero exit code,
-// which framed correct behaviour as a tool failure and made the endpoint's
-// actual posture something the operator had to infer from an error string.
-type authPostureProbe struct{}
-
-func (p *authPostureProbe) ID() string       { return "mcp-auth-posture" }
-func (p *authPostureProbe) Protocol() string { return "mcp" }
-
-func (p *authPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	anon, err := listAll(ctx, s, "tools/list", "tools", probe.WithNoAuth())
+// reproBody renders the exact JSON-RPC request body a probe sent, for the
+// HTTPExchange repro line — matches the envelope mcp.Session.Do builds (see
+// session.go's rpcRequest), with a fixed id since reproduction doesn't
+// depend on which request number this was in the session.
+func reproBody(method string, params any) string {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 	if err != nil {
-		r.Target.AuthState = report.AuthStateUnreached
-		return fmt.Errorf("anonymous tools/list failed: %w", err)
+		return ""
 	}
-
-	if anon.OK() {
-		r.Target.AuthState = report.AuthStateOpen
-		return nil
-	}
-
-	gated := isAuthRejection(anon.FirstStatus, anon.RPCError)
-	if !gated {
-		r.Target.AuthState = report.AuthStateUnknown
-		return nil
-	}
-
-	// Enumeration is gated. If credentials were supplied and they work, say
-	// so — "gated and we have keys" is a materially different recon result
-	// from "gated and we're locked out".
-	r.Target.AuthState = report.AuthStateGated
-	authed, authErr := listAll(ctx, s, "tools/list", "tools")
-	if authErr == nil && authed.OK() {
-		r.Target.AuthState = report.AuthStateAuthed
-	}
-
-	detail := fmt.Sprintf("HTTP %d", anon.FirstStatus)
-	if anon.RPCError != nil {
-		detail = fmt.Sprintf("%s, JSON-RPC error %d: %s", detail, anon.RPCError.Code, anon.RPCError.Message)
-	}
-	r.AddFinding(report.Finding{
-		ID:          "mcp-enumeration-blocked",
-		Title:       "MCP capability enumeration is gated behind authentication",
-		Severity:    report.SeverityInfo,
-		Protocol:    "mcp",
-		Description: fmt.Sprintf("An anonymous tools/list was refused (%s). The endpoint is live and speaking MCP, but will not enumerate its capability surface without credentials. This is the expected posture for a non-public server, and is recorded so an empty finding list is not mistaken for an unreachable target.", detail),
-		Evidence: map[string]any{
-			"status":     anon.FirstStatus,
-			"auth_state": r.Target.AuthState,
-		},
-		Source: "builtin:mcp",
-		Tags:   []string{"auth", "enumeration", "recon"},
-	})
-	return nil
+	return string(body)
 }
 
-// --- unauth-tools-list ------------------------------------------------
+// httpOnlyTransports is returned by probes whose check is inherently about
+// HTTP mechanics (headers, TLS, CORS, well-known metadata endpoints) and
+// therefore can't run meaningfully over a non-HTTP transport like stdio or
+// a raw WebSocket. anyTransport is returned by probes that only inspect
+// JSON-RPC payload shape and don't care which transport carried it.
+var httpOnlyTransports = []string{"http-streamable", "http-sse-legacy"}
+var anyTransport = []string{"*"}
 
-type unauthToolsListProbe struct{}
-
-func (p *unauthToolsListProbe) ID() string       { return "mcp-unauth-tools-list" }
-func (p *unauthToolsListProbe) Protocol() string { return "mcp" }
-
-func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	// Re-issue tools/list explicitly WITHOUT the auth header, regardless of
-	// whether the initial handshake used one. This answers the specific
-	// question: "can an anonymous caller enumerate tools?"
-	res, err := listAll(ctx, s, "tools/list", "tools", probe.WithNoAuth())
-	if err != nil {
-		return fmt.Errorf("anonymous tools/list failed: %w", err)
-	}
-	if !res.OK() {
-		return nil // server rejected the anonymous call — good, nothing to report
-	}
-	if len(res.Items) == 0 {
-		return nil
-	}
-
-	names := toolNames(res.Items)
-	sev := report.SeverityMedium
-	if hasHighRiskTool(names) {
-		sev = report.SeverityHigh
-	}
-
-	desc := fmt.Sprintf("tools/list returned %d tool(s) to an unauthenticated caller: %s", len(names), strings.Join(names, ", "))
-	if res.Truncated {
-		desc += " (list was truncated at reap's pagination cap; the real count is higher)"
-	}
-
-	r.AddFinding(report.Finding{
-		ID:          p.ID(),
-		Title:       "MCP tool listing accessible without authentication",
-		Severity:    sev,
-		Protocol:    "mcp",
-		ASI:         []string{"ASI02", "ASI03"},
-		Description: desc,
-		Evidence: map[string]any{
-			"tool_count": len(names),
-			"tool_names": names,
-			"pages":      res.Pages,
-			"truncated":  res.Truncated,
-		},
-		Remediation: "Require authentication before tools/list, or scope the response so anonymous callers see nothing.",
-		Source:      "builtin:mcp",
-		Tags:        []string{"auth", "enumeration"},
-	})
-	return nil
-}
-
-var highRiskToolHints = []string{"exec", "shell", "eval", "run_command", "read_file", "write_file", "sql", "browser", "fetch_url", "http_request"}
-
-func hasHighRiskTool(names []string) bool {
-	for _, n := range names {
-		lower := strings.ToLower(n)
-		for _, hint := range highRiskToolHints {
-			if strings.Contains(lower, hint) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// --- tool-capability-surface -------------------------------------------
-
-// This probe doesn't flag a vulnerability by itself — it records the full
-// tool surface so the report is a useful asset inventory even when nothing
-// else fires. It also populates report.Target.Capabilities, which is what the
-// identification block at the top of the human output renders.
-type toolCapabilitySurfaceProbe struct{}
-
-func (p *toolCapabilitySurfaceProbe) ID() string       { return "mcp-tool-capability-surface" }
-func (p *toolCapabilitySurfaceProbe) Protocol() string { return "mcp" }
-
-func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	tools, err := listAll(ctx, s, "tools/list", "tools")
-	if err != nil {
-		return fmt.Errorf("tools/list failed: %w", err)
-	}
-	if !tools.OK() {
-		return probe.NotApplicable("tools/list did not return an enumerable listing (HTTP %d)", tools.FirstStatus)
-	}
-
-	summary := &report.CapabilitySummary{Tools: len(tools.Items), Truncated: tools.Truncated}
-	for _, spec := range []struct {
-		method string
-		field  string
-		count  *int
-	}{
-		{"resources/list", "resources", &summary.Resources},
-		{"prompts/list", "prompts", &summary.Prompts},
-	} {
-		res, listErr := listAll(ctx, s, spec.method, spec.field)
-		if listErr != nil || !res.OK() {
-			continue // capability simply not offered; not an error
-		}
-		*spec.count = len(res.Items)
-		if res.Truncated {
-			summary.Truncated = true
-		}
-	}
-	r.Target.Capabilities = summary
-
-	if len(tools.Items) == 0 {
-		return nil
-	}
-
-	r.AddFinding(report.Finding{
-		ID:          p.ID(),
-		Title:       fmt.Sprintf("Tool capability inventory (%d tools)", len(tools.Items)),
-		Severity:    report.SeverityInfo,
-		Protocol:    "mcp",
-		ASI:         []string{"ASI09"},
-		Description: "Full tool surface exposed by this endpoint, for asset-inventory and diffing purposes.",
-		Evidence: map[string]any{
-			"tools":     tools.Items,
-			"pages":     tools.Pages,
-			"truncated": tools.Truncated,
-		},
-		Source: "builtin:mcp",
-		Tags:   []string{"inventory"},
-	})
-	return nil
-}
+// streamableHTTPOnly is for probes that depend on a mechanism specific to
+// the streamable-HTTP session implementation (e.g. the Mcp-Session-Id
+// response header it captures) that has no equivalent in legacy-SSE or
+// WebSocket sessions.
+var streamableHTTPOnly = []string{"http-streamable"}
 
 // --- host-header-validation -------------------------------------------
 
-// The MCP spec recommends validating the Host header to defend browser-based
-// clients against DNS rebinding. Absence of that validation is worth
-// reporting, but it is not the near-universal HIGH it was originally rated:
-// most servers behind an ingress or load balancer never see, let alone
-// validate, the original Host, so a blanket HIGH made this a permanent noise
-// floor. It stays HIGH only for loopback targets, where rebinding is directly
-// exploitable against a local agent.
 type hostHeaderValidationProbe struct{}
 
-func (p *hostHeaderValidationProbe) ID() string       { return "mcp-host-header-validation" }
-func (p *hostHeaderValidationProbe) Protocol() string { return "mcp" }
+func (p *hostHeaderValidationProbe) ID() string           { return "mcp-host-header-validation" }
+func (p *hostHeaderValidationProbe) Protocol() string     { return "mcp" }
+func (p *hostHeaderValidationProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	version := ms.NegotiatedVersion()
-	if version == "" {
-		version = SupportedProtocolVersions[0]
-	}
-
 	foreignHost := "host-header-validation.invalid"
-	raw, err := s.Do(ctx, "initialize", initializeParams(version), probe.WithHeader("Host", foreignHost))
+	params := initializeParams(negotiatedOr(s, SupportedProtocolVersions[0]))
+	raw, err := s.Do(ctx, "initialize", params, probe.WithHeader("Host", foreignHost))
 	if err != nil {
 		return fmt.Errorf("initialize with foreign Host failed: %w", err)
 	}
-	if raw.StatusCode != http.StatusOK {
+	if raw.StatusCode != 200 {
 		return nil // server refused the mismatched Host — correct behaviour
 	}
 
@@ -311,196 +90,163 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 		Result InitializeResult `json:"result"`
 		Error  *rpcError        `json:"error"`
 	}
-	if err := json.Unmarshal(raw.Body, &envelope); err != nil {
-		return probe.NotApplicable("could not decode initialize response: %v", err)
-	}
-	if envelope.Error != nil {
+	if err := json.Unmarshal(raw.Body, &envelope); err != nil || envelope.Error != nil {
 		return nil
-	}
-
-	severity := report.SeverityMedium
-	if isLoopbackTarget(ms.TargetURL()) {
-		severity = report.SeverityHigh
 	}
 
 	r.AddFinding(report.Finding{
 		ID:          p.ID(),
 		Title:       "MCP accepted initialize with a mismatched Host header",
-		Severity:    severity,
+		Severity:    hostHeaderSeverity(s.TargetURL()),
+		Confidence:  "high",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
-		Description: fmt.Sprintf("The server processed an initialize request even though the Host header was set to %q, so it does not validate the requested host name before handling MCP traffic. This is the condition DNS-rebinding protection is meant to prevent; it is rated high only for loopback endpoints, where a browser-based rebinding attack reaches a local agent directly.", foreignHost),
+		References:  []string{"MCP specification: DNS rebinding protection"},
+		Description: fmt.Sprintf("The server processed an initialize request even though the Host header was set to %q, so it does not validate the requested host name before handling MCP traffic. This is the condition DNS-rebinding protection prevents; it is rated high only for loopback endpoints, where a browser-driven rebinding attack reaches a local agent directly.", foreignHost),
 		Evidence: map[string]any{
 			"tested_host_header": foreignHost,
 			"server_name":        envelope.Result.ServerInfo.Name,
 			"server_version":     envelope.Result.ServerInfo.Version,
-			"loopback_target":    isLoopbackTarget(ms.TargetURL()),
 		},
-		Remediation: "Validate the Host header (or equivalent request target) before accepting MCP requests, and refuse requests whose host name does not match the configured endpoint.",
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Headers:     map[string]string{"Host": foreignHost, "Content-Type": "application/json"},
+			Body:        reproBody("initialize", params),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+			Expected:    "request rejected (4xx) for a Host header that doesn't match the configured endpoint",
+		},
+		Remediation: "Validate the Host header or equivalent request target before accepting MCP requests, and refuse requests whose host name does not match the configured endpoint.",
 		Source:      "builtin:mcp",
-		Tags:        []string{"transport", "host-header", "dns-rebinding"},
+		Tags:        []string{"transport", "host-header"},
 	})
 	return nil
 }
 
-// isLoopbackTarget reports whether a URL points at the local machine.
-func isLoopbackTarget(rawURL string) bool {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
-}
-
-// --- oauth metadata -----------------------------------------------------
-
-// wellKnownPaths returns the OAuth metadata locations to try for a target.
-//
-// RFC 9728 makes protected-resource metadata path-aware: the document for
-// resource https://host/mcp lives at /.well-known/oauth-protected-resource/mcp,
-// not at the host root. reap only checked the root, so it missed the metadata
-// on most real deployments — and then drew conclusions from the absence.
-func wellKnownPaths(target *url.URL) []string {
-	paths := []string{}
-	if p := strings.Trim(target.Path, "/"); p != "" {
-		paths = append(paths, "/.well-known/oauth-protected-resource/"+p)
-	}
-	return append(paths,
-		"/.well-known/oauth-protected-resource",
-		"/.well-known/oauth-authorization-server",
-	)
-}
+// --- oauth-metadata-posture --------------------------------------------
 
 type oauthMetadataPostureProbe struct{}
 
-func (p *oauthMetadataPostureProbe) ID() string       { return "mcp-oauth-metadata-posture" }
-func (p *oauthMetadataPostureProbe) Protocol() string { return "mcp" }
+func (p *oauthMetadataPostureProbe) ID() string           { return "mcp-oauth-metadata-posture" }
+func (p *oauthMetadataPostureProbe) Protocol() string     { return "mcp" }
+func (p *oauthMetadataPostureProbe) Transports() []string { return httpOnlyTransports }
 
+// oauthMetadataPostureProbe checks two independent RFC-defined signals and
+// deliberately does NOT conflate them into one finding, because they live
+// in different places and a 404 on one says nothing about the other:
+//
+//   - The Bearer challenge (RFC 9728 §5.1) belongs on the 401 response from
+//     the protected resource itself (the MCP endpoint), not on any
+//     .well-known metadata document. Checking the metadata response's
+//     headers for it — as an earlier version of this probe did — means the
+//     probe reports "missing" on every correctly-configured server, since
+//     the metadata endpoint was never the right place to look.
+//   - PKCE advertisement (RFC 8414) is a property of a published
+//     authorization-server metadata document. It can only be "missing" if
+//     that document was actually reachable (HTTP 200 + valid JSON) — a 404
+//     means "not published," a materially different, less actionable
+//     signal that must not be reported as "published but incomplete."
 func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	u, err := url.Parse(ms.TargetURL())
-	if err != nil {
-		return probe.NotApplicable("target URL is unparseable: %v", err)
+	// --- Bearer challenge: observed on the resource's own 401, not metadata. ---
+	unauthRaw, unauthErr := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	sawChallenge := unauthErr == nil && unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
+	if sawChallenge {
+		wwwAuth := unauthRaw.Headers.Get("WWW-Authenticate")
+		if !strings.Contains(strings.ToLower(wwwAuth), "bearer") {
+			r.AddFinding(report.Finding{
+				ID:          "mcp-oauth-bearer-challenge-missing",
+				Title:       "Protected resource does not send a Bearer WWW-Authenticate challenge",
+				Severity:    report.SeverityMedium,
+				Confidence:  "high", // directly observed on the actual protected-resource response
+				Protocol:    "mcp",
+				ASI:         []string{"ASI03"},
+				References:  []string{"RFC 9728 (Protected Resource Metadata)", "RFC 6750 (Bearer Token Usage)"},
+				Description: fmt.Sprintf("An unauthenticated tools/list request returned %d, but its WWW-Authenticate header did not include a Bearer challenge (got %q).", unauthRaw.StatusCode, wwwAuth),
+				Evidence:    map[string]any{"www_authenticate": wwwAuth},
+				Request: &report.HTTPExchange{
+					Method:      "POST",
+					URL:         s.TargetURL(),
+					Body:        reproBody("tools/list", map[string]any{}),
+					StatusCode:  unauthRaw.StatusCode,
+					ContentType: unauthRaw.Headers.Get("Content-Type"),
+					BodySize:    len(unauthRaw.Body),
+					Expected:    `WWW-Authenticate header containing "Bearer"`,
+				},
+				Remediation: "Send a WWW-Authenticate: Bearer challenge (optionally with a resource_metadata parameter per RFC 9728) on unauthenticated requests to protected MCP endpoints.",
+				Source:      "builtin:mcp",
+				Tags:        []string{"oauth", "authn"},
+			})
+		}
 	}
 
-	baseURL := u.Scheme + "://" + u.Host
-	observed := []string{}
+	// --- PKCE advertisement: only claimed against metadata that actually published (200). ---
+	u, err := url.Parse(s.TargetURL())
+	if err != nil {
+		return nil
+	}
+	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+	paths := []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"}
 	pkceAdvertised := false
-	for _, pth := range wellKnownPaths(u) {
-		metadata, _, status, err := fetchWellKnownJSON(ctx, ms, baseURL, pth)
-		if err != nil || status != http.StatusOK {
-			continue
+	published := false
+	var publishedPath string
+	var publishedStatus int
+	var publishedContentType string
+
+	for _, pth := range paths {
+		metadata, headers, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
+		if err != nil || status != http.StatusOK || metadata == nil {
+			continue // 404 (or any non-200) means "not published," not "published but incomplete"
 		}
-		observed = append(observed, pth)
+		published = true
+		publishedPath, publishedStatus, publishedContentType = pth, status, headers.Get("Content-Type")
 		if supportsPKCE(metadata) {
 			pkceAdvertised = true
 		}
 	}
 
-	if len(observed) == 0 {
-		return probe.NotApplicable("no OAuth metadata document was reachable")
+	if published && !pkceAdvertised {
+		r.AddFinding(report.Finding{
+			ID:          p.ID(),
+			Title:       "Published OAuth metadata does not advertise PKCE",
+			Severity:    report.SeverityLow,
+			Confidence:  "high", // directly read from a metadata document that actually returned 200
+			Protocol:    "mcp",
+			ASI:         []string{"ASI03"},
+			References:  []string{"RFC 8414 (Authorization Server Metadata)", "RFC 7636 (PKCE)"},
+			Description: fmt.Sprintf("OAuth metadata was published at %s, but it does not advertise PKCE (code_challenge_methods_supported) support.", publishedPath),
+			Evidence:    map[string]any{"published_path": publishedPath},
+			Request: &report.HTTPExchange{
+				Method:      "GET",
+				URL:         baseURL + publishedPath,
+				StatusCode:  publishedStatus,
+				ContentType: publishedContentType,
+				Expected:    `code_challenge_methods_supported: ["S256"]`,
+			},
+			Remediation: "Advertise PKCE support (code_challenge_methods_supported: [\"S256\"]) in published OAuth authorization-server metadata.",
+			Source:      "builtin:mcp",
+			Tags:        []string{"oauth", "authz"},
+		})
 	}
-	if pkceAdvertised {
-		return nil
-	}
-
-	r.AddFinding(report.Finding{
-		ID:          p.ID(),
-		Title:       "OAuth metadata does not advertise PKCE support",
-		Severity:    report.SeverityLow,
-		Protocol:    "mcp",
-		ASI:         []string{"ASI03"},
-		Description: fmt.Sprintf("OAuth metadata was published at %s, but none of the documents advertise PKCE (code_challenge_methods_supported containing S256). MCP clients are public clients, for which PKCE is required rather than optional.", strings.Join(observed, ", ")),
-		Evidence:    map[string]any{"observed_paths": observed, "pkce_advertised": false},
-		Remediation: "Advertise code_challenge_methods_supported: [\"S256\"] in the authorization server metadata and require PKCE for authorization code flows.",
-		Source:      "builtin:mcp",
-		Tags:        []string{"oauth", "authn", "pkce"},
-	})
 	return nil
 }
 
-// --- oauth bearer challenge --------------------------------------------
-
-// oauthBearerChallengeProbe checks the place the challenge actually lives.
-//
-// This check previously read WWW-Authenticate off the /.well-known/* GET
-// response, where it never appears — a 200 metadata document has no reason to
-// carry an authentication challenge. The result was a finding that fired on
-// every server publishing OAuth metadata, including correctly-configured ones.
-// RFC 9728 and the MCP authorization spec put the challenge on the protected
-// resource's own 401, so that is what reap now inspects.
-type oauthBearerChallengeProbe struct{}
-
-func (p *oauthBearerChallengeProbe) ID() string       { return "mcp-oauth-bearer-challenge-missing" }
-func (p *oauthBearerChallengeProbe) Protocol() string { return "mcp" }
-
-func (p *oauthBearerChallengeProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	res, err := listAll(ctx, s, "tools/list", "tools", probe.WithNoAuth())
-	if err != nil {
-		return fmt.Errorf("anonymous tools/list failed: %w", err)
-	}
-	if !isAuthRejection(res.FirstStatus, res.RPCError) {
-		// Nothing was refused, so there is no challenge to be missing. An
-		// open endpoint is reported by mcp-unauth-tools-list instead.
-		return probe.NotApplicable("endpoint did not refuse the anonymous request, so no challenge is expected")
-	}
-	if res.FirstStatus != http.StatusUnauthorized {
-		// A JSON-RPC-level refusal with a 200/400 is out of scope: WWW-Authenticate
-		// is only meaningful alongside a 401.
-		return probe.NotApplicable("refusal was not an HTTP 401 (got %d)", res.FirstStatus)
-	}
-
-	challenge := ""
-	if res.FirstHeaders != nil {
-		challenge = res.FirstHeaders.Get("WWW-Authenticate")
-	}
-	if strings.Contains(strings.ToLower(challenge), "bearer") {
-		return nil
-	}
-
-	r.AddFinding(report.Finding{
-		ID:          p.ID(),
-		Title:       "MCP endpoint returns 401 without a Bearer WWW-Authenticate challenge",
-		Severity:    report.SeverityMedium,
-		Protocol:    "mcp",
-		ASI:         []string{"ASI03"},
-		Description: "An unauthenticated tools/list was refused with HTTP 401, but the response carried no 'WWW-Authenticate: Bearer' header. Clients cannot discover where to authenticate, so they cannot begin the OAuth flow the MCP authorization spec describes.",
-		Evidence: map[string]any{
-			"status":               res.FirstStatus,
-			"www_authenticate":     challenge,
-			"www_authenticate_set": challenge != "",
-		},
-		Remediation: "Return 'WWW-Authenticate: Bearer resource_metadata=\"<protected-resource-metadata-url>\"' alongside the 401, per RFC 9728 and the MCP authorization specification.",
-		Source:      "builtin:mcp",
-		Tags:        []string{"oauth", "authn", "discovery"},
-	})
-	return nil
-}
-
-func fetchWellKnownJSON(ctx context.Context, ms *Session, baseURL, path string) (map[string]any, http.Header, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+func fetchWellKnownJSON(ctx context.Context, baseURL, path string) (map[string]any, http.Header, int, error) {
+	url := baseURL + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := ms.client.HTTP().Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, resp.Header, resp.StatusCode, err
+		return nil, nil, resp.StatusCode, err
 	}
 	var parsed map[string]any
 	if len(data) > 0 {
@@ -553,37 +299,31 @@ func containsStringValue(value any, expected string) bool {
 
 type redirectUriLaxityProbe struct{}
 
-func (p *redirectUriLaxityProbe) ID() string       { return "mcp-redirect-uri-laxity" }
-func (p *redirectUriLaxityProbe) Protocol() string { return "mcp" }
+func (p *redirectUriLaxityProbe) ID() string           { return "mcp-redirect-uri-laxity" }
+func (p *redirectUriLaxityProbe) Protocol() string     { return "mcp" }
+func (p *redirectUriLaxityProbe) Transports() []string { return httpOnlyTransports }
 
 func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
+	u, err := url.Parse(s.TargetURL())
 	if err != nil {
-		return err
+		return nil
 	}
-	u, err := url.Parse(ms.TargetURL())
-	if err != nil {
-		return probe.NotApplicable("target URL is unparseable: %v", err)
-	}
-	baseURL := u.Scheme + "://" + u.Host
-
+	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+	paths := []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"}
 	redirectURIs := []string{}
-	found := false
-	for _, pth := range wellKnownPaths(u) {
-		metadata, _, status, err := fetchWellKnownJSON(ctx, ms, baseURL, pth)
+	var lastPath string
+	var lastStatus int
+	for _, pth := range paths {
+		metadata, _, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
 		if err != nil || status != http.StatusOK || metadata == nil {
-			continue
+			continue // 404 (or any non-200) is "not published," not parseable metadata
 		}
-		found = true
+		lastPath, lastStatus = pth, status
 		redirectURIs = append(redirectURIs, findRedirectURIs(metadata)...)
-	}
-	if !found {
-		return probe.NotApplicable("no OAuth metadata document was reachable")
 	}
 	if len(redirectURIs) == 0 {
 		return nil
 	}
-
 	broad := []string{}
 	for _, uri := range redirectURIs {
 		if isBroadRedirectURI(uri) {
@@ -597,10 +337,20 @@ func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *re
 		ID:          p.ID(),
 		Title:       "OAuth redirect URI registration appears overly broad",
 		Severity:    report.SeverityMedium,
+		Confidence:  "medium",
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
+		References:  []string{"RFC 6749 §3.1.2 (Redirection Endpoint)", "RFC 8252 (OAuth for Native Apps)"},
 		Description: "The discovered OAuth metadata includes redirect URIs that are broad or wildcarded, which increases the risk of confused-deputy or open redirect abuse.",
-		Evidence:    map[string]any{"redirect_uris": broad},
+		Evidence: map[string]any{
+			"redirect_uris": broad,
+		},
+		Request: &report.HTTPExchange{
+			Method:     "GET",
+			URL:        baseURL + lastPath,
+			StatusCode: lastStatus,
+			Expected:   "redirect_uris scoped to exact origins/paths, no wildcards",
+		},
 		Remediation: "Restrict registered redirect URIs to exact allowed origins and paths, and avoid wildcards or overly permissive URL patterns.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"oauth", "redirect-uri"},
@@ -643,11 +393,6 @@ func isBroadRedirectURI(target string) bool {
 	if err != nil {
 		return true
 	}
-	// Loopback redirects are how native MCP clients are supposed to work
-	// (RFC 8252), so http://127.0.0.1/... is correct rather than lax.
-	if parsed.Scheme == "http" && isBroadRedirectLoopback(parsed.Hostname()) {
-		return false
-	}
 	if parsed.Scheme != "https" {
 		return true
 	}
@@ -660,32 +405,24 @@ func isBroadRedirectURI(target string) bool {
 	return false
 }
 
-func isBroadRedirectLoopback(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 // --- session-id-entropy -------------------------------------------------
 
 type sessionIDEntropyProbe struct{}
 
-func (p *sessionIDEntropyProbe) ID() string       { return "mcp-session-id-entropy" }
-func (p *sessionIDEntropyProbe) Protocol() string { return "mcp" }
+func (p *sessionIDEntropyProbe) ID() string           { return "mcp-session-id-entropy" }
+func (p *sessionIDEntropyProbe) Protocol() string     { return "mcp" }
+func (p *sessionIDEntropyProbe) Transports() []string { return streamableHTTPOnly }
 
 func (p *sessionIDEntropyProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	ms, err := asSession(s)
 	if err != nil {
 		return err
 	}
-	sessionID := ms.SessionID()
-	if sessionID == "" {
+	if ms.SessionID() == "" {
 		return probe.NotApplicable("server issued no Mcp-Session-Id")
 	}
 
-	issues, entropy := analyzeSessionID(sessionID)
+	issues, entropy := analyzeSessionID(ms.SessionID())
 	if len(issues) == 0 {
 		return nil
 	}
@@ -697,42 +434,25 @@ func (p *sessionIDEntropyProbe) Run(ctx context.Context, s probe.Session, r *rep
 		ID:          p.ID(),
 		Title:       "MCP session ID entropy looks weak or predictable",
 		Severity:    severity,
+		Confidence:  "high", // directly measured against the ID string itself, not a heuristic guess
 		Protocol:    "mcp",
 		ASI:         []string{"ASI03"},
+		References:  []string{"NIST SP 800-63B §5.1.1 (session identifier entropy)"},
 		Description: fmt.Sprintf("The MCP session ID returned by the server appears to have low entropy or a predictable format: %s", strings.Join(issues, ", ")),
-		// The session ID itself is deliberately NOT recorded. It is a live
-		// credential, and reports get uploaded to code-scanning dashboards and
-		// pasted into tickets. The shape is enough to justify the finding.
 		Evidence: map[string]any{
-			"session_id_shape":       describeSessionIDShape(sessionID),
-			"session_id_length":      len(sessionID),
+			"session_id_shape":       describeSessionIDShape(ms.SessionID()),
+			"session_id_length":      len(ms.SessionID()),
 			"estimated_entropy_bits": entropy,
 			"issues":                 issues,
 		},
+		// No HTTPExchange: the session ID was captured from the
+		// Mcp-Session-Id response header on an earlier, arbitrary call, not
+		// a single request this probe made itself.
 		Remediation: "Use a cryptographically random, high-entropy session identifier for MCP sessions and avoid sequential or human-readable formats.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"session", "auth"},
 	})
 	return nil
-}
-
-// describeSessionIDShape summarises a session ID without disclosing it: a
-// character-class skeleton such as "aaaa9999" for "sess0012".
-func describeSessionIDShape(id string) string {
-	var b strings.Builder
-	for _, r := range id {
-		switch {
-		case unicode.IsDigit(r):
-			b.WriteRune('9')
-		case unicode.IsLower(r):
-			b.WriteRune('a')
-		case unicode.IsUpper(r):
-			b.WriteRune('A')
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return b.String()
 }
 
 // analyzeSessionID estimates how guessable a session ID is.
@@ -741,8 +461,8 @@ func describeSessionIDShape(id string) string {
 // distinct characters actually present. Counting distinct characters
 // systematically misjudges good identifiers: a random 32-character hex string
 // carries 128 bits, but by the birthday problem it contains only ~14 of the 16
-// hex digits, so a "fewer than 16 distinct characters" rule flagged it as weak.
-// The same rule fired on every hex and base32 ID reap ever saw.
+// hex digits, so a "fewer than 16 distinct characters" rule flagged it as
+// weak. The same rule fired on every hex, base32 and UUID identifier reap saw.
 func analyzeSessionID(id string) ([]string, float64) {
 	issues := []string{}
 	if len(id) == 0 {
@@ -797,7 +517,6 @@ func inferAlphabetSize(id string, unique map[rune]struct{}) int {
 			hexOnly = false
 		case r == '-' || r == '_':
 			hasURLSafe = true
-			hexOnly = false
 		default:
 			hasOther = true
 			hexOnly = false
@@ -809,7 +528,7 @@ func inferAlphabetSize(id string, unique map[rune]struct{}) int {
 		// Unknown encoding: don't credit more than what was observed.
 		return len(unique)
 	case hexOnly && (hasDigit || hasLower):
-		return 16 // hex
+		return 16 // hex, with or without UUID separators
 	case hasURLSafe || (hasLower && hasUpper && hasDigit):
 		return 64 // base64url / base62-with-separators
 	case hasLower && hasUpper:
@@ -825,6 +544,245 @@ func inferAlphabetSize(id string, unique map[rune]struct{}) int {
 	}
 }
 
+func asSession(s probe.Session) (*Session, error) {
+	ms, ok := s.(*Session)
+	if !ok {
+		return nil, fmt.Errorf("mcp probe received non-MCP session")
+	}
+	return ms, nil
+}
+
+// --- unauth-tools-list ------------------------------------------------
+
+type unauthToolsListProbe struct{}
+
+func (p *unauthToolsListProbe) ID() string           { return "mcp-unauth-tools-list" }
+func (p *unauthToolsListProbe) Protocol() string     { return "mcp" }
+func (p *unauthToolsListProbe) Transports() []string { return anyTransport }
+
+func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
+	// Re-issue tools/list explicitly WITHOUT the auth header, regardless of
+	// whether the initial handshake used one. This answers the specific
+	// question: "can an anonymous caller enumerate tools?"
+	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	if err != nil {
+		return nil // network failure is not a finding; leave silent, CLI logs errors separately
+	}
+	if raw.StatusCode != 200 {
+		return nil // server rejected the anonymous call — good, nothing to report
+	}
+
+	var envelope struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+		Error *rpcError `json:"error"`
+	}
+	if err := json.Unmarshal(raw.Body, &envelope); err != nil {
+		return nil
+	}
+	if envelope.Error != nil {
+		return nil // server correctly refused at the protocol level
+	}
+	if len(envelope.Result.Tools) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(envelope.Result.Tools))
+	for _, t := range envelope.Result.Tools {
+		if n, ok := t["name"].(string); ok {
+			names = append(names, n)
+		}
+	}
+
+	sev := report.SeverityMedium
+	if hasHighRiskTool(names) {
+		sev = report.SeverityHigh
+	}
+
+	r.AddFinding(report.Finding{
+		ID:          p.ID(),
+		Title:       "MCP tool listing accessible without authentication",
+		Severity:    sev,
+		Confidence:  "high",
+		Protocol:    "mcp",
+		ASI:         []string{"ASI02", "ASI03"},
+		Description: fmt.Sprintf("tools/list returned %d tool(s) to an unauthenticated caller: %s", len(names), strings.Join(names, ", ")),
+		Evidence:    map[string]any{"tool_count": len(names), "tool_names": names},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+			Expected:    "401/403 for an anonymous (no Authorization header) tools/list call",
+		},
+		Remediation: "Require authentication before tools/list, or scope the response so anonymous callers see nothing.",
+		Source:      "builtin:mcp",
+		Tags:        []string{"auth", "enumeration"},
+	})
+	return nil
+}
+
+var highRiskToolHints = []string{"exec", "shell", "eval", "run_command", "read_file", "write_file", "sql", "browser", "fetch_url", "http_request"}
+
+func hasHighRiskTool(names []string) bool {
+	for _, n := range names {
+		lower := strings.ToLower(n)
+		for _, hint := range highRiskToolHints {
+			if strings.Contains(lower, hint) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dangerousToolCategories maps a capability category to name/description
+// keyword hints suggesting a tool has it — the agent-native equivalent of
+// nmap flagging port 22 open. A security engineer looking at a tool
+// inventory wants "which of these touch the filesystem, spawn a shell,
+// reach out to the network, or handle secrets" without reading every
+// inputSchema by hand.
+var dangerousToolCategories = map[string][]string{
+	"filesystem":       {"read_file", "write_file", "readfile", "writefile", "delete_file", "list_dir", "list_directory"},
+	"shell_exec":       {"exec", "shell", "eval", "run_command", "subprocess", "bash", "powershell"},
+	"network_egress":   {"fetch_url", "http_request", "curl", "download", "webhook", "fetch"},
+	"database":         {"sql", "query_db", "database"},
+	"browser_control":  {"browser", "puppeteer", "playwright"},
+	"secrets_handling": {"api_key", "credential", "password", "secret", "token"},
+}
+
+// dangerousTools inspects a tools/list result and returns, per tool name,
+// which dangerous-capability categories it appears to fall into by name or
+// description — same keyword-heuristic ceiling as hasHighRiskTool above,
+// but surfaced as first-class inventory (every match, not just "any match
+// found") rather than folded into a single severity bump.
+func dangerousTools(tools []map[string]any) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range tools {
+		name, _ := t["name"].(string)
+		desc, _ := t["description"].(string)
+		text := strings.ToLower(name + " " + desc)
+		var cats []string
+		for cat, hints := range dangerousToolCategories {
+			for _, h := range hints {
+				if strings.Contains(text, h) {
+					cats = append(cats, cat)
+					break
+				}
+			}
+		}
+		if len(cats) > 0 {
+			sort.Strings(cats)
+			out[name] = cats
+		}
+	}
+	return out
+}
+
+// --- tool-capability-surface -------------------------------------------
+
+// This probe doesn't flag a vulnerability by itself — it records the full
+// tool surface as an informational finding so the JSON report is a useful
+// asset inventory even when nothing else fires.
+type toolCapabilitySurfaceProbe struct{}
+
+func (p *toolCapabilitySurfaceProbe) ID() string           { return "mcp-tool-capability-surface" }
+func (p *toolCapabilitySurfaceProbe) Protocol() string     { return "mcp" }
+func (p *toolCapabilitySurfaceProbe) Transports() []string { return anyTransport }
+
+func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
+	tools, listErr := listAll(ctx, s, "tools/list", "tools")
+	if listErr != nil {
+		return fmt.Errorf("tools/list failed: %w", listErr)
+	}
+	raw := &probe.RawResult{StatusCode: tools.FirstStatus, Headers: tools.FirstHeaders}
+	if raw.Headers == nil {
+		raw.Headers = http.Header{}
+	}
+	if raw.StatusCode == http.StatusUnauthorized || raw.StatusCode == http.StatusForbidden {
+		// REAP's whole pitch is enumerating the agent surface — going
+		// silent when that's blocked reads as "the feature isn't there."
+		// A server correctly gating tools/list behind auth is a legitimate,
+		// informative outcome; say so instead of just returning nothing.
+		r.AddFinding(report.Finding{
+			ID:          "mcp-enumeration-blocked",
+			Title:       "Tool enumeration blocked by authentication",
+			Severity:    report.SeverityInfo,
+			Confidence:  "high",
+			Protocol:    "mcp",
+			ASI:         []string{"ASI09"},
+			Description: fmt.Sprintf("tools/list returned %d without credentials — the server correctly gates enumeration behind authentication, so no tool inventory is available from this vantage point.", raw.StatusCode),
+			Evidence:    map[string]any{"status_code": raw.StatusCode},
+			Request: &report.HTTPExchange{
+				Method:      "POST",
+				URL:         s.TargetURL(),
+				Body:        reproBody("tools/list", map[string]any{}),
+				StatusCode:  raw.StatusCode,
+				ContentType: raw.Headers.Get("Content-Type"),
+				BodySize:    len(raw.Body),
+			},
+			Source: "builtin:mcp",
+			Tags:   []string{"inventory", "auth"},
+		})
+		return nil
+	}
+	if !tools.OK() {
+		return probe.NotApplicable("tools/list did not return an enumerable listing (HTTP %d)", tools.FirstStatus)
+	}
+
+	// Record the surface size even when it is zero: "this endpoint exposes no
+	// tools" is a real recon result, and the identification block should say
+	// so rather than omitting the line.
+	summary := &report.CapabilitySummary{Tools: len(tools.Items), Truncated: tools.Truncated}
+	for _, spec := range []struct {
+		method string
+		field  string
+		count  *int
+	}{
+		{"resources/list", "resources", &summary.Resources},
+		{"prompts/list", "prompts", &summary.Prompts},
+	} {
+		res, err := listAll(ctx, s, spec.method, spec.field)
+		if err != nil || !res.OK() {
+			continue // capability simply not offered; not an error
+		}
+		*spec.count = len(res.Items)
+		if res.Truncated {
+			summary.Truncated = true
+		}
+	}
+	r.Target.Capabilities = summary
+
+	if len(tools.Items) == 0 {
+		return nil
+	}
+
+	r.AddFinding(report.Finding{
+		ID:          p.ID(),
+		Title:       fmt.Sprintf("Tool capability inventory (%d tools)", len(tools.Items)),
+		Severity:    report.SeverityInfo,
+		Confidence:  "high",
+		Protocol:    "mcp",
+		ASI:         []string{"ASI09"},
+		Description: "Full tool surface exposed by this endpoint, for asset-inventory and diffing purposes.",
+		Evidence:    map[string]any{"tools": tools.Items, "dangerous_tools": dangerousTools(tools.Items), "pages": tools.Pages, "truncated": tools.Truncated},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
+		Source: "builtin:mcp",
+		Tags:   []string{"inventory"},
+	})
+	return nil
+}
+
 // --- instructions-exposure --------------------------------------------
 
 // The MCP initialize response has an optional free-text "instructions"
@@ -834,20 +792,14 @@ func inferAlphabetSize(id string, unique map[rune]struct{}) int {
 // prompt if the server hands it over during the handshake.
 type instructionsExposureProbe struct{}
 
-func (p *instructionsExposureProbe) ID() string       { return "mcp-instructions-exposure" }
-func (p *instructionsExposureProbe) Protocol() string { return "mcp" }
+func (p *instructionsExposureProbe) ID() string           { return "mcp-instructions-exposure" }
+func (p *instructionsExposureProbe) Protocol() string     { return "mcp" }
+func (p *instructionsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	ms, err := asSession(s)
-	if err != nil {
-		return err
-	}
-	init, raw, err := ms.Initialize(ctx)
-	if err != nil {
-		return probe.NotApplicable("handshake did not succeed: %v", err)
-	}
-	if raw == nil || raw.StatusCode != http.StatusOK || init == nil {
-		return probe.NotApplicable("no usable initialize response")
+	init, raw, err := InitializeSession(ctx, s)
+	if err != nil || raw == nil || raw.StatusCode != 200 || init == nil {
+		return nil
 	}
 	if strings.TrimSpace(init.Instructions) == "" {
 		return nil
@@ -868,10 +820,19 @@ func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r 
 		ID:          p.ID(),
 		Title:       "MCP handshake returns lengthy or sensitive-flavored instructions",
 		Severity:    report.SeverityLow,
+		Confidence:  "medium", // keyword/length heuristic on free text, explicitly not a confirmed leak
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: "The initialize response's 'instructions' field is long and/or contains language patterns (secrecy directives, 'internal', credential-related terms) worth a human review to confirm it isn't leaking operational or internal detail to any caller.",
 		Evidence:    map[string]any{"instructions_length": len(init.Instructions), "instructions_excerpt": excerpt(init.Instructions, 200)},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("initialize", initializeParams(negotiatedOr(s, SupportedProtocolVersions[0]))),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
 		Remediation: "Keep client-facing instructions limited to usage guidance; keep anything sensitive out of fields returned pre-authentication.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"information-disclosure"},
@@ -890,41 +851,55 @@ func excerpt(s string, n int) string {
 
 type resourcesPromptsExposureProbe struct{}
 
-func (p *resourcesPromptsExposureProbe) ID() string       { return "mcp-resources-prompts-exposure" }
-func (p *resourcesPromptsExposureProbe) Protocol() string { return "mcp" }
+func (p *resourcesPromptsExposureProbe) ID() string           { return "mcp-resources-prompts-exposure" }
+func (p *resourcesPromptsExposureProbe) Protocol() string     { return "mcp" }
+func (p *resourcesPromptsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	applicable := false
-	for _, spec := range []struct{ method, field string }{
-		{"resources/list", "resources"},
-		{"prompts/list", "prompts"},
-	} {
-		res, err := listAll(ctx, s, spec.method, spec.field, probe.WithNoAuth())
-		if err != nil {
-			return fmt.Errorf("anonymous %s failed: %w", spec.method, err)
-		}
-		if !res.OK() {
+	for _, method := range []string{"resources/list", "prompts/list"} {
+		raw, err := s.Do(ctx, method, map[string]any{}, probe.WithNoAuth())
+		if err != nil || raw.StatusCode != 200 {
 			continue
 		}
-		applicable = true
-		if len(res.Items) == 0 {
+		var envelope struct {
+			Result map[string]json.RawMessage `json:"result"`
+			Error  *rpcError                  `json:"error"`
+		}
+		if err := json.Unmarshal(raw.Body, &envelope); err != nil || envelope.Error != nil {
+			continue
+		}
+		var count int
+		for _, v := range envelope.Result {
+			var arr []json.RawMessage
+			if json.Unmarshal(v, &arr) == nil {
+				count += len(arr)
+			}
+		}
+		if count == 0 {
 			continue
 		}
 		r.AddFinding(report.Finding{
-			ID:          p.ID() + "-" + strings.ReplaceAll(spec.method, "/", "-"),
-			Title:       fmt.Sprintf("Unauthenticated %s returns %d item(s)", spec.method, len(res.Items)),
+			ID:          p.ID() + "-" + strings.ReplaceAll(method, "/", "-"),
+			Title:       fmt.Sprintf("Unauthenticated %s returns %d item(s)", method, count),
 			Severity:    report.SeverityLow,
+			Confidence:  "high",
 			Protocol:    "mcp",
 			ASI:         []string{"ASI02"},
-			Description: fmt.Sprintf("%s succeeded without credentials and returned %d item(s) to an anonymous caller.", spec.method, len(res.Items)),
-			Evidence:    map[string]any{"method": spec.method, "item_count": len(res.Items), "truncated": res.Truncated},
+			Description: fmt.Sprintf("%s succeeded without credentials and returned %d item(s) to an anonymous caller.", method, count),
+			Evidence:    map[string]any{"method": method, "item_count": count},
+			Request: &report.HTTPExchange{
+				Method:      "POST",
+				URL:         s.TargetURL(),
+				Body:        reproBody(method, map[string]any{}),
+				StatusCode:  raw.StatusCode,
+				ContentType: raw.Headers.Get("Content-Type"),
+				BodySize:    len(raw.Body),
+				Expected:    "401/403 for an anonymous " + method + " call",
+			},
 			Remediation: "Gate resource/prompt listings behind authentication if their contents aren't meant to be public.",
 			Source:      "builtin:mcp",
 			Tags:        []string{"auth", "enumeration"},
 		})
-	}
-	if !applicable {
-		return probe.NotApplicable("neither resources/list nor prompts/list answered an anonymous caller")
 	}
 	return nil
 }
@@ -935,7 +910,14 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 // The implementation must not invoke any tool; it only inspects the declared
 // tools/list response.
 //
-// The heuristic looks for two independent signals across the full tool list:
+// The previous logic was too narrow: it only emitted when one exact search tool
+// and one exact dispatcher were both found, and it matched dispatcher schemas by
+// a small set of field names. That missed valid patterns such as name variants
+// like toolName/action, and it failed to treat a generic dispatcher alone as
+// suspicious.
+//
+// The current heuristic looks for two independent signals across the full tool
+// list:
 //   - Signal A: a catalog/search tool whose name or description signals discovery
 //     of OTHER tools/operations.
 //   - Signal B: a generic executor whose inputSchema declares a required string
@@ -949,18 +931,27 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 // deliberately avoid these naming/schema signals.
 type dynamicDispatchProbe struct{}
 
-func (p *dynamicDispatchProbe) ID() string       { return "mcp-dynamic-dispatch" }
-func (p *dynamicDispatchProbe) Protocol() string { return "mcp" }
+func (p *dynamicDispatchProbe) ID() string           { return "mcp-dynamic-dispatch" }
+func (p *dynamicDispatchProbe) Protocol() string     { return "mcp" }
+func (p *dynamicDispatchProbe) Transports() []string { return anyTransport }
 
 func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	res, err := listAll(ctx, s, "tools/list", "tools")
-	if err != nil {
-		return fmt.Errorf("tools/list failed: %w", err)
+	raw, err := s.Do(ctx, "tools/list", map[string]any{})
+	if err != nil || raw.StatusCode != 200 {
+		return nil
 	}
-	if !res.OK() {
-		return probe.NotApplicable("tools/list did not return an enumerable listing (HTTP %d)", res.FirstStatus)
+
+	var envelope struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
 	}
-	if len(res.Items) == 0 {
+	if err := json.Unmarshal(raw.Body, &envelope); err != nil {
+		return nil
+	}
+
+	tools := envelope.Result.Tools
+	if len(tools) == 0 {
 		return nil
 	}
 
@@ -968,7 +959,7 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 	var dispatcherTools []string
 	var highRisk bool
 
-	for _, tool := range res.Items {
+	for _, tool := range tools {
 		name, ok := tool["name"].(string)
 		if !ok {
 			continue
@@ -998,13 +989,13 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 
 	description := fmt.Sprintf(
 		"A generic executor tool was detected: %s. This suggests the true callable surface may exceed the static tools/list inventory.",
-		strings.Join(dispatcherTools, ", "),
+		joinNames(dispatcherTools),
 	)
 	if len(searchTools) > 0 {
 		description = fmt.Sprintf(
 			"Discovery tool(s) %s and executor tool(s) %s were detected. This indicates tools/list likely undercounts the real capability surface because callable tools can be reached through search + dispatch.",
-			strings.Join(searchTools, ", "),
-			strings.Join(dispatcherTools, ", "),
+			joinNames(searchTools),
+			joinNames(dispatcherTools),
 		)
 	}
 
@@ -1012,6 +1003,7 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 		ID:          p.ID(),
 		Title:       "Enumerated MCP tool surface is likely incomplete (dynamic dispatch detected)",
 		Severity:    severity,
+		Confidence:  "medium", // naming/schema-convention heuristic, deliberately evadable — see package comment above
 		Protocol:    "mcp",
 		ASI:         []string{"ASI09"},
 		Description: description,
@@ -1019,12 +1011,24 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 			"search_tools":   searchTools,
 			"dispatch_tools": dispatcherTools,
 		},
+		Request: &report.HTTPExchange{
+			Method:      "POST",
+			URL:         s.TargetURL(),
+			Body:        reproBody("tools/list", map[string]any{}),
+			StatusCode:  raw.StatusCode,
+			ContentType: raw.Headers.Get("Content-Type"),
+			BodySize:    len(raw.Body),
+		},
 		Remediation: "Expose a complete dispatchable tool manifest or provide a discoverable read-only tool inventory (for example, an extended list endpoint) so downstream security tooling can account for the full surface.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"inventory", "capability-surface"},
 	})
 
 	return nil
+}
+
+func joinNames(names []string) string {
+	return strings.Join(names, ", ")
 }
 
 // isDispatcherTool checks if a tool schema exhibits dispatcher characteristics:
@@ -1165,4 +1169,142 @@ func hasQueryStringProperty(tool map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// negotiatedOr returns the protocol version the session actually negotiated,
+// falling back to fallback for sessions that aren't the streamable-HTTP
+// implementation (or haven't handshaken yet).
+func negotiatedOr(s probe.Session, fallback string) string {
+	if ms, ok := s.(*Session); ok {
+		if v := ms.NegotiatedVersion(); v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
+// hostHeaderSeverity rates missing Host validation.
+//
+// Almost nothing behind an ingress or load balancer sees, let alone validates,
+// the original Host header, so a blanket HIGH made this check a permanent
+// noise floor rather than a signal. HIGH is reserved for loopback targets,
+// where a browser-driven DNS-rebinding attack reaches a local agent directly
+// and the finding is genuinely actionable.
+func hostHeaderSeverity(target string) report.Severity {
+	if isLoopbackTarget(target) {
+		return report.SeverityHigh
+	}
+	return report.SeverityMedium
+}
+
+func isLoopbackTarget(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// describeSessionIDShape summarises a session ID without disclosing it: a
+// character-class skeleton such as "aaaa999" for "sess001".
+func describeSessionIDShape(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		switch {
+		case unicode.IsDigit(r):
+			b.WriteRune('9')
+		case unicode.IsLower(r):
+			b.WriteRune('a')
+		case unicode.IsUpper(r):
+			b.WriteRune('A')
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// isAuthRejection reports whether a response is the server declining for lack
+// of credentials, as opposed to any other failure. Both the HTTP status and
+// the JSON-RPC error are checked because MCP servers signal this either way.
+func isAuthRejection(status int, rpcErr *rpcError) bool {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return true
+	}
+	if rpcErr == nil {
+		return false
+	}
+	m := strings.ToLower(rpcErr.Message)
+	for _, hint := range []string{"unauthorized", "unauthenticated", "authentication", "auth required", "forbidden", "access denied", "permission", "invalid token", "missing token", "api key"} {
+		if strings.Contains(m, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAuthGated reports whether a raw response is the server declining for lack
+// of credentials rather than failing. The CLI uses it to keep an auth-gated
+// handshake out of the report's error list: a gated endpoint is a successful
+// recon result, not a tool failure, and must not make the process exit nonzero.
+func IsAuthGated(raw *probe.RawResult) bool {
+	if raw == nil {
+		return false
+	}
+	var envelope struct {
+		Error *rpcError `json:"error"`
+	}
+	_ = json.Unmarshal(raw.Body, &envelope)
+	return isAuthRejection(raw.StatusCode, envelope.Error)
+}
+
+// --- auth-posture -------------------------------------------------------
+
+// authPostureProbe establishes the single most useful recon fact about an
+// agent endpoint: does capability enumeration answer a stranger, does it
+// require credentials, or does it not answer at all?
+//
+// This used to be implicit. An auth-gated endpoint produced an "initialize
+// handshake failed" entry in the report's error list and a nonzero exit code,
+// which framed correct behaviour as a tool failure and left the endpoint's
+// actual posture to be inferred from an error string.
+type authPostureProbe struct{}
+
+func (p *authPostureProbe) ID() string           { return "mcp-auth-posture" }
+func (p *authPostureProbe) Protocol() string     { return "mcp" }
+func (p *authPostureProbe) Transports() []string { return anyTransport }
+
+func (p *authPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
+	anon, err := listAll(ctx, s, "tools/list", "tools", probe.WithNoAuth())
+	if err != nil {
+		r.Target.AuthState = report.AuthStateUnreached
+		return fmt.Errorf("anonymous tools/list failed: %w", err)
+	}
+
+	if anon.OK() {
+		r.Target.AuthState = report.AuthStateOpen
+		return nil
+	}
+	if !isAuthRejection(anon.FirstStatus, anon.RPCError) {
+		r.Target.AuthState = report.AuthStateUnknown
+		return nil
+	}
+
+	// Enumeration is gated. If credentials were supplied and they work, say
+	// so — "gated and we have keys" is a materially different recon result
+	// from "gated and we're locked out".
+	r.Target.AuthState = report.AuthStateGated
+	if authed, authErr := listAll(ctx, s, "tools/list", "tools"); authErr == nil && authed.OK() {
+		r.Target.AuthState = report.AuthStateAuthed
+	}
+
+	// The mcp-enumeration-blocked finding itself is emitted by
+	// toolCapabilitySurfaceProbe, which has the reproduction exchange to
+	// attach to it. This probe's job is the Target.AuthState field.
+	return nil
 }

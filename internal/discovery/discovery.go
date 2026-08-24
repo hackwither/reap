@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hackwither/reap/internal/httpx"
+	"github.com/hackwither/reap/internal/report"
 )
 
 type CandidateKind string
@@ -49,12 +50,18 @@ type Fingerprint struct {
 	ProtocolVer string
 	Evidence    map[string]any
 	DetectorID  string // which Detector produced this, for provenance/debugging
+
+	// Request is the single request/response this Fingerprint was matched
+	// from, in the same shape a Finding's reproduction uses — a detector
+	// firing "high confidence" on a target is exactly the kind of claim
+	// someone should be able to re-run themselves, same as any finding.
+	Request *report.HTTPExchange
 }
 
 // DetectOptions carries the same cross-cutting knobs probe.Probe already has
 // so Detectors don't need their own parallel config surface. Client is shared
-// with the scan pipeline, so --proxy, --insecure, --user-agent and the rate
-// limit apply to discovery too.
+// with the scan pipeline, so --proxy, --insecure, --user-agent, --retries and
+// the rate limit apply to discovery too rather than only to probes.
 type DetectOptions struct {
 	Timeout    time.Duration
 	AuthHeader string

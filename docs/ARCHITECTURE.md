@@ -1,37 +1,34 @@
 # Architecture
 
 ```
-                          ┌────────────────────┐
-    CLI flags / targets ──▶│   internal/cli      │  flag validation, target
-                          │  (orchestration)    │  collection, session
-                          └──────────┬──────────┘  selection, exit codes
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              ▼                      ▼                      ▼
-   ┌───────────────────┐  ┌────────────────────┐  ┌───────────────────┐
-   │ internal/discovery │  │ internal/probe/... │  │  internal/httpx    │
-   │  Detectors +       │  │  mcp   (protocol)  │  │  one client for    │
-   │  JSON fingerprints │  │  transport ("*")   │  │  every request:    │
-   │  "what is this?"   │  │  generic (session) │  │  proxy, TLS, UA,   │
-   └─────────┬─────────┘  └─────────┬──────────┘  │  retries, rate cap │
-             │                       │             └───────────────────┘
-             │            ┌──────────┴──────────┐
-             │            │  internal/template   │
-             │            │  JSON → Probe        │
-             │            └──────────┬──────────┘
-             │                       │
-             └───────────┬───────────┘
-                         ▼
-              ┌────────────────────┐
-              │   internal/probe    │  Probe + Session contracts,
-              │  (Registry,         │  Registry, ErrNotApplicable.
-              │   Session, sentinel)│  The safety boundary lives here.
-              └──────────┬─────────┘
-                         ▼
-              ┌────────────────────┐
-              │   internal/report   │  Finding, ProbeRun, Target,
-              │  (model + writers)  │  ASI table, text/JSON/SARIF
-              └────────────────────┘
+                         ┌──────────────────┐
+   CLI flags/scope ─────▶│   internal/cli    │  authorization gate lives here 
+                         │  (orchestration)   │  nothing below this line runs
+                         └─────────┬─────────┘  without --authorized
+                                   │
+                    ┌──────────────┼───────────────┐
+                    ▼                               ▼
+          ┌──────────────────┐            ┌──────────────────────┐
+          │ internal/probe/mcp│            │  internal/template     │
+          │  (built-in Go     │            │  (JSON-template loader │
+          │   probes + the    │            │   → generic Probe      │
+          │   MCP Session/    │            │   adapter)              │
+          │   transport)      │            └───────────┬──────────┘
+          └─────────┬────────┘                          │
+                    │                                    │
+                    └─────────────────┬──────────────────┘
+                                      ▼
+                          ┌──────────────────────┐
+                          │   internal/probe      │  shared Probe interface +
+                          │  (Registry, Session    │  Registry; this is the only
+                          │   interface, contract) │  contract new protocols must
+                          └───────────┬───────────┘  implement
+                                      ▼
+                          ┌──────────────────────┐
+                          │   internal/report      │  Finding/Report model,
+                          │  (ASI mapping, JSON/    │  ASI01–ASI10 reference table,
+                          │   human renderers)      │  JSON + text output
+                          └──────────────────────┘
 ```
 
 `internal/version` is a leaf holding the version string and default User-Agent; everything else depends on it.
@@ -56,48 +53,15 @@ Two consequences worth being explicit about:
 
 If a future contribution genuinely needs to distinguish "tool exists" from "tool is actually callable" (a real and useful distinction), the right design is a narrowly-scoped `DryRunCapabilityCheck` that validates a tool's declared JSON schema without invoking it — not a general invoke path. Open an issue before building this so we can agree on the boundary.
 
-### What `--authorized` is and isn't
-
-It is an acknowledgement, printed as a warning when absent. It is **not** an access control, and it never was: anyone can pass the flag. Earlier versions of this document claimed nothing below the CLI layer runs without it, which was never true in the code. Treating a self-asserted boolean as a safety mechanism would be worse than treating it as what it is — a prompt to think before scanning.
-
-## Evidence integrity
-
-A recon tool's negative results are only worth as much as its ability to tell them apart from failures. Every probe returns one of three things:
-
-| Return | Meaning | Recorded as |
-|---|---|---|
-| `nil` | Ran and reached a conclusion | `ran` — absent findings are a real negative |
-| `probe.ErrNotApplicable` | Correctly declined (TLS check on `http://`, no session ID issued) | `not-applicable` |
-| any other error | Could not complete | `error`, and the report becomes `incomplete` |
-
-`report.Report.Probes` carries one `ProbeRun` per probe, and `Report.Status` is `complete` or `incomplete`. A scan that hit its deadline, or whose handshake failed for transport reasons, can never be mistaken for a clean target — the human output says so in a banner, the JSON says so in a field, and the process exits 3.
-
-An auth-gated endpoint is explicitly *not* a failure. It produces `auth_state: auth-gated`, an info-level `mcp-enumeration-blocked` finding, an empty error list, and exit 0.
-
-## Protocol neutrality
-
-Checks split along one axis: does this check read the protocol, or only the transport?
-
-- `internal/probe/mcp` — needs MCP semantics. `Protocol() == "mcp"`.
-- `internal/probe/transport` — needs a URL and an HTTP client. `Protocol() == "*"`, so `probe.Registry.ForProtocol` hands them to every target regardless of protocol.
-- `internal/probe/generic` — a `probe.Session` that performs plain HTTP requests, used when discovery identifies a protocol REAP can't enumerate yet.
-
-Together these mean an A2A agent card or an OpenAPI service produces a real report — identification, plus TLS, plaintext, downgrade, CORS and rate-limit posture — with no protocol-specific probe written. `cli.newSession` selects the implementation; nothing hardcodes `mcp.NewSession`.
+Note: `mcp-dynamic-dispatch` relies on naming and schema conventions rather than a semantic proof of dispatch. An operator can evade it by avoiding the expected search/catalog wording and by defining a generic executor schema without the common field names or freeform object shape.
 
 ## Adding a new protocol
 
-1. Create `internal/probe/<protocol>/` with a `Session` implementation (see `internal/probe/mcp/session.go` for the MCP reference over streamable HTTP, or `internal/probe/generic/session.go` for the minimal shape).
-2. Implement the handshake/negotiation step your protocol needs as a method on your session, mirroring `Session.Initialize`. Keep anything that writes to the target unexported.
-3. Add a fingerprint so discovery can identify it: usually a JSON file in `fingerprints/<protocol>/`, no Go required. Declare `paths` explicitly — a fingerprint without them only tries `/`.
-4. Write built-in probes in `<protocol>/checks.go` implementing `probe.Probe`. Only write ones that genuinely need protocol semantics; transport-level checks already run via `internal/probe/transport`.
-5. Register them from `buildProbeRegistry` in `internal/cli/cli.go`, add the protocol to `validProtocol`, and add a case to `newSession`.
-6. Templates automatically work against your protocol once `Template.Protocol` matches — the loader and matcher engine are protocol-agnostic.
-
-## One client for every request
-
-`internal/httpx` builds the single `*httpx.Client` a run uses. This is not incidental tidiness: there were previously six independent client and dialer construction sites, four of which hardcoded a 10-second timeout and ignored `--timeout`, which made flags like `--proxy` and `--insecure` impossible to honour consistently. The rate limiter also has to be shared — a per-probe limiter multiplies the requested rate by the number of probes.
-
-`InspectTLS` is the one deliberate exception to certificate verification: it always skips it, because its job is to report on certificates that *would* fail verification, and refusing the connection would mean never producing the finding.
+1. Create `internal/probe/<protocol>/` with a `Session` implementation (see `internal/probe/mcp/session.go` for the MCP reference implementation over streamable HTTP).
+2. Implement the handshake/negotiation step your protocol needs (MCP: `initialize`; A2A: agent card discovery; etc.) as a method on your session, mirroring `Session.Initialize`.
+3. Write built-in probes in `<protocol>/checks.go` implementing `probe.Probe`.
+4. Register them from `cli.Run` alongside the existing `mcp.BuiltinProbes()` call.
+5. Templates automatically work against your protocol once `Template.Protocol` matches — the loader and matcher engine are protocol-agnostic.
 
 ## Why JSON templates instead of YAML (for now)
 

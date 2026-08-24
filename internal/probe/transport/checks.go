@@ -44,6 +44,14 @@ func BuiltinProbes(client *httpx.Client) []probe.Probe {
 	}
 }
 
+// httpTransports: these checks inspect HTTP mechanics (TLS, headers, CORS),
+// so they can't run meaningfully over stdio or a raw WebSocket. The plaintext
+// check only reads the URL scheme, so it is transport-agnostic.
+var (
+	httpTransports = []string{"http-streamable", "http-sse-legacy"}
+	anyTransport   = []string{"*"}
+)
+
 // httpsTarget parses a session's target and requires https, since the TLS and
 // downgrade checks have nothing to say about a plaintext endpoint.
 func httpsTarget(s probe.Session) (*url.URL, error) {
@@ -61,8 +69,9 @@ func httpsTarget(s probe.Session) (*url.URL, error) {
 
 type plaintextProbe struct{}
 
-func (p *plaintextProbe) ID() string       { return "transport-plaintext" }
-func (p *plaintextProbe) Protocol() string { return "*" }
+func (p *plaintextProbe) ID() string           { return "transport-plaintext" }
+func (p *plaintextProbe) Protocol() string     { return "*" }
+func (p *plaintextProbe) Transports() []string { return anyTransport }
 
 func (p *plaintextProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	if !common.IsPlaintextURL(s.TargetURL()) {
@@ -87,8 +96,9 @@ func (p *plaintextProbe) Run(ctx context.Context, s probe.Session, r *report.Rep
 
 type tlsCertHealthProbe struct{ client *httpx.Client }
 
-func (p *tlsCertHealthProbe) ID() string       { return "tls-cert-health" }
-func (p *tlsCertHealthProbe) Protocol() string { return "*" }
+func (p *tlsCertHealthProbe) ID() string           { return "tls-cert-health" }
+func (p *tlsCertHealthProbe) Protocol() string     { return "*" }
+func (p *tlsCertHealthProbe) Transports() []string { return httpTransports }
 
 func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	u, err := httpsTarget(s)
@@ -170,8 +180,9 @@ func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report
 
 type downgradeProbe struct{ client *httpx.Client }
 
-func (p *downgradeProbe) ID() string       { return "transport-downgrade" }
-func (p *downgradeProbe) Protocol() string { return "*" }
+func (p *downgradeProbe) ID() string           { return "transport-downgrade" }
+func (p *downgradeProbe) Protocol() string     { return "*" }
+func (p *downgradeProbe) Transports() []string { return httpTransports }
 
 func (p *downgradeProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	u, err := httpsTarget(s)
@@ -223,8 +234,9 @@ func (p *downgradeProbe) Run(ctx context.Context, s probe.Session, r *report.Rep
 // OPTIONS preflight, which reap never sent.
 type corsWildcardProbe struct{ client *httpx.Client }
 
-func (p *corsWildcardProbe) ID() string       { return "http-cors-wildcard" }
-func (p *corsWildcardProbe) Protocol() string { return "*" }
+func (p *corsWildcardProbe) ID() string           { return "http-cors-wildcard" }
+func (p *corsWildcardProbe) Protocol() string     { return "*" }
+func (p *corsWildcardProbe) Transports() []string { return httpTransports }
 
 const probeOrigin = "https://reap-cors-probe.invalid"
 
@@ -346,8 +358,9 @@ func (p *corsWildcardProbe) request(ctx context.Context, method, target string, 
 
 type rateLimitProbe struct{ client *httpx.Client }
 
-func (p *rateLimitProbe) ID() string       { return "http-rate-limit-absence" }
-func (p *rateLimitProbe) Protocol() string { return "*" }
+func (p *rateLimitProbe) ID() string           { return "http-rate-limit-absence" }
+func (p *rateLimitProbe) Protocol() string     { return "*" }
+func (p *rateLimitProbe) Transports() []string { return httpTransports }
 
 func (p *rateLimitProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	// Ask in both shapes and stay silent if either answer advertises limiting.

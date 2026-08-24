@@ -354,15 +354,64 @@ func (s *Session) Initialize(ctx context.Context) (*InitializeResult, *probe.Raw
 
 // handshake tries each supported protocol version in order.
 func (s *Session) handshake(ctx context.Context) (*InitializeResult, *probe.RawResult, error) {
+	res, raw, accepted, err := negotiateInitialize(ctx, s)
+	if err != nil {
+		return nil, raw, err
+	}
+	s.mu.Lock()
+	s.negotiatedVersion = accepted
+	if raw != nil && raw.Headers != nil {
+		if sid := raw.Headers.Get("Mcp-Session-Id"); sid != "" {
+			s.sessionID = sid
+		}
+	}
+	s.mu.Unlock()
+	return res, raw, nil
+}
+
+// InitializeSession performs the MCP handshake against any probe.Session
+// implementation — streamable-HTTP, legacy-SSE, WebSocket, or any future
+// transport. Every transport speaks the same JSON-RPC "initialize" method
+// once a Session exists, so the handshake logic itself doesn't need to be
+// transport-specific; only Session.Do's wire format differs underneath.
+func InitializeSession(ctx context.Context, sess probe.Session) (*InitializeResult, *probe.RawResult, error) {
+	// A streamable-HTTP Session must go through its own Initialize: that is
+	// where the negotiated protocol version, the Mcp-Session-Id, and the
+	// spec-required notifications/initialized are recorded and sent. Calling
+	// negotiateInitialize directly here would complete a handshake the session
+	// itself knows nothing about, so every later request would omit the
+	// MCP-Protocol-Version header and a strict server would reject it.
+	if ms, ok := sess.(*Session); ok {
+		return ms.Initialize(ctx)
+	}
+	res, raw, _, err := negotiateInitialize(ctx, sess)
+	return res, raw, err
+}
+
+// negotiateInitialize walks SupportedProtocolVersions against sess and returns
+// the first accepted handshake along with the version that was accepted.
+//
+// Two independent things are going on here, and both are load-bearing:
+//
+//   - The ladder. A server speaking only an older revision answers a
+//     single hardcoded protocolVersion with an error. Without the retry, the
+//     handshake fails, every probe below silently reports nothing, and the
+//     target reads as clean when reap never actually spoke to it.
+//   - The validation. A response is only a handshake if it looks like one. A
+//     401 body from some unrelated API, or a 200 whose JSON has neither
+//     "result" nor "error", used to decode into an empty-but-error-free
+//     envelope and get reported as a confirmed MCP server with empty
+//     serverInfo.
+func negotiateInitialize(ctx context.Context, sess probe.Session) (*InitializeResult, *probe.RawResult, string, error) {
 	var lastRaw *probe.RawResult
 	var lastErr error
 
 	for _, ver := range SupportedProtocolVersions {
-		raw, err := s.do(ctx, "initialize", initializeParams(ver), &probe.ReqOpts{})
+		raw, err := sess.Do(ctx, "initialize", initializeParams(ver))
 		if err != nil {
 			// Transport failure: the ladder can't help, and retrying every
 			// rung would multiply the wait on an unreachable host.
-			return nil, raw, err
+			return nil, raw, "", err
 		}
 		lastRaw = raw
 
@@ -370,45 +419,48 @@ func (s *Session) handshake(ctx context.Context) (*InitializeResult, *probe.RawR
 			Result InitializeResult `json:"result"`
 			Error  json.RawMessage  `json:"error"` // may be object {"code":…,"message":…} OR plain string
 		}
-		if decodeErr := json.Unmarshal(raw.Body, &envelope); decodeErr != nil {
-			lastErr = fmt.Errorf("decode initialize response: %w", decodeErr)
-			continue
-		}
-		if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		decodeErr := json.Unmarshal(raw.Body, &envelope)
+
+		if decodeErr == nil && len(envelope.Error) > 0 && string(envelope.Error) != "null" {
 			msg := rpcErrorMessage(envelope.Error)
 			lastErr = fmt.Errorf("server returned JSON-RPC error: %s", msg)
 			if isVersionRejection(raw.StatusCode, msg) {
 				continue // try the next rung
 			}
-			return nil, raw, lastErr
+			return nil, raw, "", lastErr
 		}
+
+		// A non-200 must never count as a successful handshake, even when the
+		// error body happens to be valid JSON.
 		if raw.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("initialize returned HTTP %d", raw.StatusCode)
+			lastErr = fmt.Errorf("server returned HTTP %d for initialize (expected 200)", raw.StatusCode)
 			if isVersionRejection(raw.StatusCode, string(raw.Body)) {
 				continue
 			}
-			return nil, raw, lastErr
+			return nil, raw, "", lastErr
+		}
+		if decodeErr != nil {
+			return nil, raw, "", fmt.Errorf("decode initialize response: %w", decodeErr)
+		}
+		// A 200 with neither field is the same false-match risk as the 401
+		// case above: require the result to actually look like an MCP
+		// initialize result, not merely "not an error".
+		if envelope.Result.ProtocolVersion == "" && envelope.Result.ServerInfo.Name == "" {
+			return nil, raw, "", fmt.Errorf("initialize response included neither protocolVersion nor serverInfo.name — doesn't look like a real MCP handshake result")
 		}
 
 		accepted := envelope.Result.ProtocolVersion
 		if accepted == "" {
 			accepted = ver
 		}
-		s.mu.Lock()
-		s.negotiatedVersion = accepted
-		if sid := raw.Headers.Get("Mcp-Session-Id"); sid != "" {
-			s.sessionID = sid
-		}
-		s.mu.Unlock()
-
 		result := envelope.Result
-		return &result, raw, nil
+		return &result, raw, accepted, nil
 	}
 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no supported MCP protocol version was accepted")
 	}
-	return nil, lastRaw, lastErr
+	return nil, lastRaw, "", lastErr
 }
 
 // isVersionRejection reports whether a failed initialize looks like "I don't

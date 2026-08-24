@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hackwither/reap/internal/report"
+	"github.com/hackwither/reap/internal/version"
 )
 
 // --- target collection --------------------------------------------------
@@ -271,7 +272,7 @@ func TestRun_VersionFlag(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("expected exit code 0, got %d", code)
 	}
-	if !strings.Contains(stdout, "reap v"+Version) {
+	if !strings.Contains(stdout, "reap v"+version.Version) {
 		t.Fatalf("expected stdout to contain version string, got: %s", stdout)
 	}
 	if strings.Contains(stderr, "Reconnaissance and Enumeration for Agent Protocols") {
@@ -469,8 +470,12 @@ func TestRun_OutFileWrittenForTextOutput(t *testing.T) {
 	if len(data) == 0 {
 		t.Fatal("--out file is empty for text output")
 	}
-	if !strings.Contains(string(data), "reap report") {
+	if !strings.Contains(string(data), "AI AGENT RECON") {
 		t.Fatalf("--out file does not contain a report: %s", data)
+	}
+	// A file report must not carry terminal escape sequences.
+	if strings.Contains(string(data), "\x1b[") {
+		t.Fatal("--out file contains ANSI colour escapes")
 	}
 }
 
@@ -496,5 +501,182 @@ func TestRun_MinSeverityFiltersOutput(t *testing.T) {
 	// rather than findings.
 	if len(rep.Probes) == 0 {
 		t.Fatal("expected probe records to be unaffected by --min-severity")
+	}
+}
+func TestRun_BareOriginResolvesToRealEndpointPath(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r) // root is NOT an MCP endpoint
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body.ID,
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+				"serverInfo":      map[string]any{"name": "bare-origin-gateway", "version": "1.0"},
+				"capabilities":    map[string]any{},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprintsDir := filepath.Join("..", "..", "fingerprints")
+	code := Run([]string{
+		"--protocol", "auto",
+		"--authorized",
+		"-t", srv.URL, // bare origin — httptest.NewServer's URL has no path
+		"--templates", "",
+		"--fingerprints", fingerprintsDir,
+		"--no-banner",
+		"--output", "json",
+		"--timeout", "3s",
+	}, outW, errW)
+
+	outW.Close()
+	errW.Close()
+	var outBuf, errBuf bytes.Buffer
+	if _, err := outBuf.ReadFrom(outR); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := errBuf.ReadFrom(errR); err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, errBuf.String())
+	}
+
+	var rep report.Report
+	if err := json.Unmarshal(outBuf.Bytes(), &rep); err != nil {
+		t.Fatalf("failed to decode report JSON: %v; stdout: %s", err, outBuf.String())
+	}
+	if rep.Target.URL != srv.URL+"/mcp" {
+		t.Fatalf("expected the report to reflect the resolved endpoint %s/mcp, got %q — discovery found it but the scan still hit the wrong URL", srv.URL, rep.Target.URL)
+	}
+	if !rep.Target.Confirmed {
+		t.Fatalf("expected the handshake against the resolved endpoint to succeed, got Confirmed=false, reason=%q", rep.Target.ConfirmReason)
+	}
+	if rep.Target.ServerName != "bare-origin-gateway" {
+		t.Fatalf("expected server_name from the real /mcp endpoint, got %q", rep.Target.ServerName)
+	}
+}
+
+func TestRun_BareOriginResolvesUnderStaticProtocol(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID int `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      body.ID,
+			"result": map[string]any{
+				"protocolVersion": "2025-06-18",
+				"serverInfo":      map[string]any{"name": "static-protocol-gateway", "version": "1.0"},
+				"capabilities":    map[string]any{},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprintsDir := filepath.Join("..", "..", "fingerprints")
+	code := Run([]string{
+		// no --protocol flag at all: exercises the default "mcp" static path
+		"--authorized",
+		"-t", srv.URL,
+		"--templates", "",
+		"--fingerprints", fingerprintsDir,
+		"--no-banner",
+		"--output", "json",
+		"--timeout", "3s",
+	}, outW, errW)
+
+	outW.Close()
+	errW.Close()
+	var outBuf, errBuf bytes.Buffer
+	if _, err := outBuf.ReadFrom(outR); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := errBuf.ReadFrom(errR); err != nil {
+		t.Fatal(err)
+	}
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, errBuf.String())
+	}
+
+	var rep report.Report
+	if err := json.Unmarshal(outBuf.Bytes(), &rep); err != nil {
+		t.Fatalf("failed to decode report JSON: %v; stdout: %s", err, outBuf.String())
+	}
+	if rep.Target.URL != srv.URL+"/mcp" {
+		t.Fatalf("expected the report to reflect the resolved endpoint %s/mcp under static --protocol=mcp, got %q", srv.URL, rep.Target.URL)
+	}
+	if !rep.Target.Confirmed {
+		t.Fatalf("expected the handshake against the resolved endpoint to succeed, got Confirmed=false, reason=%q", rep.Target.ConfirmReason)
+	}
+}
+
+func TestParseFlags_Color(t *testing.T) {
+	for _, mode := range []string{"auto", "always", "never"} {
+		opts, _, err := parseFlags([]string{"--color", mode})
+		if err != nil {
+			t.Fatalf("--color %s: %v", mode, err)
+		}
+		if opts.Color != mode {
+			t.Fatalf("--color %s parsed as %q", mode, opts.Color)
+		}
+	}
+	if _, _, err := parseFlags([]string{"--color", "sometimes"}); err == nil {
+		t.Fatal("expected invalid --color value to fail")
+	}
+}
+
+func TestHumanColorEnabled(t *testing.T) {
+	output, err := os.CreateTemp(t.TempDir(), "report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+
+	if humanColorEnabled("auto", output) {
+		t.Fatal("auto color must be disabled for redirected output")
+	}
+	if !humanColorEnabled("always", output) {
+		t.Fatal("always must enable color for redirected output")
+	}
+	if humanColorEnabled("never", output) {
+		t.Fatal("never must disable color")
 	}
 }

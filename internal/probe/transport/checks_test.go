@@ -17,7 +17,7 @@ import (
 
 func testClient(t *testing.T) *httpx.Client {
 	t.Helper()
-	c, err := httpx.New(httpx.Config{Timeout: 5 * time.Second}, version.UserAgent)
+	c, err := httpx.New(httpx.Config{Timeout: 5 * time.Second}, version.UserAgent())
 	if err != nil {
 		t.Fatalf("httpx.New: %v", err)
 	}

@@ -16,6 +16,8 @@
 
 **REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL — or a bare `host:port` — that you're authorized to test, and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
 
+<img width="1080" height="600" alt="reap_video-6" src="https://github.com/user-attachments/assets/fe5cf8f2-c584-4476-9353-99eb50c619f9" />
+
 > **Use only against systems you own or are explicitly authorized to test.** `--authorized` is an acknowledgement, not an access control: REAP still runs without it, and prints a warning. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
 
 ## Why REAP exists
@@ -37,7 +39,6 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 ## Install
 
 Release binaries (Linux, macOS, Windows; amd64 and arm64) are attached to each [release](https://github.com/hackwither/reap/releases).
-
 ```sh
 go install github.com/hackwither/reap/cmd/reap@latest
 ```
@@ -56,7 +57,6 @@ cd reap && go build -o bin/reap ./cmd/reap
 ```
 
 Requires Go 1.22+. No other dependencies.
-
 > `go install` places only the binary on your path. REAP loads templates and fingerprints from disk at startup, so point `--templates` and `--fingerprints` at a checkout, or use a release archive or the Docker image, both of which bundle them.
 
 ## Quick start
@@ -111,6 +111,27 @@ reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif --fail-on h
     sarif_file: reap.sarif
 ```
 
+## Discovery: "is there an agent here at all?"
+
+Point `-t` at a URL without knowing the protocol, and `--protocol auto` figures out whether — and how — it speaks MCP before running a single security check:
+
+```sh
+reap -t https://maybe-an-mcp-host.example --protocol auto --authorized
+```
+
+This is the fix for the single biggest trust-killer a recon tool can have: firing a stack of findings against a target that was never actually confirmed to speak the protocol being scanned (a plain web server returning `200`/HTML on every path looks a lot like a listener if nothing checks). Every finding carries a `confidence` ("high"/"medium"/"low"), and if the target never completes a real protocol handshake, `reap` says so loudly and caps every finding at `info`/low-confidence rather than reporting them at face value:
+
+```
+⚠ TARGET NOT CONFIRMED AS AGENT ENDPOINT
+  mcp initialize handshake failed: decode initialize response: invalid character '<'
+  looking for beginning of value. Findings below are LOW confidence and likely
+  reflect a generic web server, not a real MCP handshake.
+```
+
+`--mode=discover` runs Discovery only (no enumeration/assessment) and prints the resolved `Fingerprint` — protocol, transport, confidence, server metadata — for every target. `--list-detectors` lists the registered detectors, the discovery-time sibling of `--list-probes`.
+
+Discovered/assumed transport also picks which `Session` implementation actually runs the scan: streamable-HTTP, legacy pre-2025-03-26 HTTP+SSE, or a raw WebSocket (non-standard, but observed in some community gateways) — each behind the same `Session` interface and the same no-invoke boundary, so every existing probe and template runs unmodified regardless of which one it lands on.
+
 ## Output
 
 The identification block comes first. REAP is a recon tool, so what the endpoint *is* leads, and posture findings follow.
@@ -142,7 +163,7 @@ reap report — http://10.0.0.7:8080/mcp
 
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10); see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does.
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10) — see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
 
 ### Recon: what is this endpoint, and what will it tell a stranger?
 
@@ -197,9 +218,14 @@ Drop a JSON template in `templates/`, no Go, no rebuild:
 
 ```json
 {
-  "id": "mcp-custom-header-leak",
+  "id": "mcp-tmpl-custom-header-leak",
   "protocol": "mcp",
-  "info": { "title": "Internal service header exposed", "severity": "medium" },
+"info": {
+    "title": "Internal service header disclosed",
+    "severity": "medium",
+    "asi_refs": ["ASI09"],
+    "description": "tools/list responses disclose an internal-service header."
+  },
   "request": { "method": "tools/list" },
   "match_logic": "all",
   "matchers": [
@@ -209,7 +235,9 @@ Drop a JSON template in `templates/`, no Go, no rebuild:
 }
 ```
 
-Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` / `all`. Discovery fingerprints in `fingerprints/` use the same matcher vocabulary to identify protocols — see [`docs/WRITING_PROBES.md`](docs/WRITING_PROBES.md).
+Matchers: `status_code`, `header`, `body_contains`, `json_path`, combined with `any` (default) / `all` via `match_logic`. See [`docs/WRITING_PROBES.md`](docs/WRITING_PROBES.md) for the full field reference, including `info.references` and how confidence/reproduction are derived automatically.
+
+Discovery fingerprints in `fingerprints/` use the same matcher vocabulary to identify protocols.
 
 A template deliberately **cannot** chain requests, branch on response data, or invoke a discovered tool. The first two are a roadmap item. The third never will be. If your check needs real logic, write a Go probe, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -227,11 +255,15 @@ The strict fixture is the more useful of the two — it only answers a client th
 
 ## Roadmap
 
-- **A2A and OpenAPI enumeration**: discovery and transport posture work today; skill/operation enumeration doesn't exist yet.
+Shipped: automatic protocol/transport discovery (`--protocol auto`, `--mode discover`), confidence-scored findings with a hard downgrade for unconfirmed targets, legacy HTTP+SSE and WebSocket transports alongside streamable-HTTP.
+
+Planned, not yet shipped:
+
+- **A2A and OpenAPI enumeration**: discovery and transport posture work today; skill/operation enumeration does not exist yet.
 - **Baseline diffing**: compare a scan against a stored previous run to surface capability-surface drift.
 - **Tag-based selection**: `--tags` alongside `--include`, once probes carry tags rather than only findings.
+- **stdio transport**: a manually-specified local MCP server launch (`--target-stdio`), behind the same `Session` interface and no-invoke boundary.
 - **Bounded range discovery**: sweep an operator-supplied host and port list for agent endpoints.
-- **stdio transport**: for locally-launched MCP servers, behind the same `Session` interface and no-invoke boundary.
 
 Issues and PRs welcome on any of these.
 

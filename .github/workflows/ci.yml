@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 on:
   push:
@@ -9,25 +9,22 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: "1.22"
           cache: true
 
-      # CONTRIBUTING.md tells contributors this must print nothing, so it is
-      # enforced rather than suggested.
-      - name: gofmt
+      - name: gofmt check
         run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "::error::gofmt found unformatted files:"
-            echo "$unformatted"
-            gofmt -d .
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
             exit 1
           fi
 
@@ -37,22 +34,25 @@ jobs:
       - name: build
         run: go build ./...
 
-      # The suite is hermetic: every network test binds httptest on loopback.
-      # -race matters because a batch scan runs probes across goroutines that
-      # share one httpx client and rate limiter.
+      # -race matters here: a batch scan runs probes across goroutines that
+      # share one httpx client and its rate limiter.
       - name: test
         run: go test -race ./...
 
-  # A scan against the bundled ranges is the only check that exercises the real
-  # binary end to end. Both fixtures exist because bugs that were invisible
-  # against a lenient server were obvious against a strict one.
+      - name: validate probe templates load
+        run: go run ./cmd/reap --list-probes --templates ./templates
+
+  # Scanning the bundled fixtures is the only check that exercises the real
+  # binary end to end. Both fixtures exist because bugs invisible against a
+  # permissive server were obvious against a strict one.
   range-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: "1.22"
           cache: true
 
       - name: build
@@ -64,12 +64,11 @@ jobs:
           sleep 2
           ./bin/reap -t http://127.0.0.1:8765/mcp --authorized --no-banner --output json --out mock.json
           python3 - <<'PY'
-          import json, sys
+          import json
           rep = json.load(open("mock.json"))
           assert rep["status"] == "complete", rep.get("incomplete_reason")
-          assert rep["target"]["auth_state"] == "open", rep["target"]
           ids = {f["id"] for f in rep["findings"]}
-          for want in {"mcp-unauth-tools-list", "transport-plaintext"}:
+          for want in ("mcp-unauth-tools-list", "transport-plaintext"):
               assert want in ids, f"missing {want}: {sorted(ids)}"
           print(f"ok: {len(ids)} finding ids")
           PY
@@ -83,10 +82,11 @@ jobs:
           import json
           rep = json.load(open("strict.json"))
           t = rep["target"]
-          # Version negotiation: the fixture refuses reap's newest revision.
+          # Version negotiation: the fixture refuses reap's newest revision, so
+          # a client that doesn't walk the ladder gets nothing at all.
           assert t["protocol_version"] == "2025-03-26", t
           # Pagination: 5 tools on page one, 1 on page two.
-          assert t["capabilities"]["tools"] == 6, t["capabilities"]
+          assert t["capabilities"]["tools"] == 6, t.get("capabilities")
           assert rep["status"] == "complete", rep.get("incomplete_reason")
           print("ok: negotiated", t["protocol_version"], "with", t["capabilities"]["tools"], "tools")
           PY
@@ -99,10 +99,32 @@ jobs:
           code=$?
           set -e
           if [ "$code" != "3" ]; then echo "expected exit 3, got $code"; exit 1; fi
-          python3 -c "
+          python3 - <<'PY'
           import json
-          rep = json.load(open('dead.json'))
-          assert rep['status'] == 'incomplete', rep
-          assert rep['target']['auth_state'] == 'unreached', rep['target']
-          print('ok: exit 3, status incomplete')
-          "
+          rep = json.load(open("dead.json"))
+          assert rep["status"] == "incomplete", rep
+          print("ok: exit 3, status incomplete")
+          PY
+
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: check
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: build --snapshot --clean

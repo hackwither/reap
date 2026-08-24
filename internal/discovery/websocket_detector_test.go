@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/hackwither/reap/internal/probe/common"
 )
 
 func wsUpgradeServer() *httptest.Server {
@@ -21,7 +23,7 @@ func wsUpgradeServer() *httptest.Server {
 			return
 		}
 		defer conn.Close()
-		accept := expectedWebSocketAccept(key)
+		accept := common.ExpectedWebSocketAccept(key)
 		buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n")
 		buf.Flush()
 	}))

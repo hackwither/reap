@@ -248,3 +248,106 @@ func TestDoCachesIdenticalReads(t *testing.T) {
 		t.Fatalf("an unauthenticated read must not be served from the authenticated cache entry, got %d requests", got)
 	}
 }
+
+// TestInitializeSession_RejectsNonOKStatus is a regression test for a real
+// false-positive: a 401 response whose body happens to be valid JSON but
+// isn't JSON-RPC shaped (e.g. {"title":"Unauthorized",...}, no "result" or
+// "error" key) used to decode into an empty-but-error-free envelope and get
+// reported as a confirmed MCP handshake. HTTP status must be checked
+// before anything else.
+func TestInitializeSession_RejectsNonOKStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"title":"Unauthorized","type":"about:blank","status":401,"detail":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	sess := NewSession(srv.URL, "", testClient(t))
+	init, raw, err := InitializeSession(context.Background(), sess)
+	if err == nil {
+		t.Fatalf("expected an error for a 401 response, got success: init=%+v", init)
+	}
+	if init != nil {
+		t.Fatalf("expected nil InitializeResult on failure, got %+v", init)
+	}
+	if raw == nil || raw.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected the raw 401 response to be returned alongside the error, got %+v", raw)
+	}
+}
+
+// TestInitializeSession_RejectsOKWithUnrecognizableBody guards the other
+// half of the same gap: even a 200, if the body has neither protocolVersion
+// nor serverInfo.name, isn't a real MCP handshake result.
+func TestInitializeSession_RejectsOKWithUnrecognizableBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`)) // valid JSON, not an MCP result
+	}))
+	defer srv.Close()
+
+	sess := NewSession(srv.URL, "", testClient(t))
+	init, _, err := InitializeSession(context.Background(), sess)
+	if err == nil {
+		t.Fatalf("expected an error for a 200 body with no protocolVersion/serverInfo, got success: init=%+v", init)
+	}
+}
+
+// TestInitializeSession_AcceptsRealHandshake is the positive control for
+// both regression tests above.
+func TestInitializeSession_AcceptsRealHandshake(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"real-gateway","version":"1.0"}}}`))
+	}))
+	defer srv.Close()
+
+	sess := NewSession(srv.URL, "", testClient(t))
+	init, _, err := InitializeSession(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("unexpected error for a real handshake: %v", err)
+	}
+	if init.ServerInfo.Name != "real-gateway" {
+		t.Fatalf("expected server name real-gateway, got %q", init.ServerInfo.Name)
+	}
+}
+
+// TestInitializeSessionRecordsStateOnStreamableSession is a regression test
+// for a merge bug: InitializeSession used to negotiate the handshake directly
+// instead of delegating to (*Session).Initialize, so the session never learned
+// its negotiated version or session ID and never sent
+// notifications/initialized. Every later request then omitted the
+// MCP-Protocol-Version header and a strict server rejected the whole scan,
+// while the report still claimed the handshake had succeeded.
+func TestInitializeSessionRecordsStateOnStreamableSession(t *testing.T) {
+	srv := &strictServer{
+		supported:   map[string]bool{"2024-11-05": true},
+		requireHdr:  true,
+		requireInit: true,
+	}
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	sess := testSession(t, ts.URL)
+	if _, _, err := InitializeSession(context.Background(), sess); err != nil {
+		t.Fatalf("InitializeSession: %v", err)
+	}
+	if got := sess.NegotiatedVersion(); got != "2024-11-05" {
+		t.Fatalf("session did not record the negotiated version, got %q", got)
+	}
+	if sess.SessionID() == "" {
+		t.Fatal("session did not capture Mcp-Session-Id from the handshake")
+	}
+
+	// The real proof: a follow-up request must be accepted by a server that
+	// enforces both spec requirements.
+	res, err := listAll(context.Background(), sess, "tools/list", "tools")
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	if !res.OK() {
+		t.Fatalf("post-handshake request rejected (HTTP %d) — session state was not recorded", res.FirstStatus)
+	}
+}

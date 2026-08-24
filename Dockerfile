@@ -1,23 +1,24 @@
-# Build a static binary, then ship it on a minimal base. reap has no
-# third-party Go dependencies, so there is nothing to vendor or audit here.
+# syntax=docker/dockerfile:1
+
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY go.mod ./
-COPY cmd ./cmd
-COPY internal ./internal
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/reap ./cmd/reap
+COPY . .
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath \
+      -ldflags "-s -w -X github.com/hackwither/reap/internal/version.Version=${VERSION}" \
+      -o /out/reap ./cmd/reap
 
 FROM alpine:3.20
-# Certificates are required: reap scans https:// endpoints and inspects their
-# certificates, so a scratch image would fail every TLS target.
-RUN apk add --no-cache ca-certificates \
-    && adduser -D -u 10001 reap
-WORKDIR /reap
+RUN apk add --no-cache ca-certificates && \
+    adduser -D -u 10001 reap
 COPY --from=build /out/reap /usr/local/bin/reap
-# Templates and fingerprints are loaded from disk at runtime; without them the
-# container silently runs with no templates and no discovery detectors.
-COPY templates ./templates
-COPY fingerprints ./fingerprints
+COPY templates/ /app/templates/
+COPY fingerprints/ /app/fingerprints/
+WORKDIR /app
 USER reap
 ENTRYPOINT ["reap"]
 CMD ["--help"]
