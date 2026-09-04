@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 type SSESession struct {
 	sseURL     string
 	authHeader string
+	client     *httpx.Client
 	httpClient *http.Client
 
 	connOnce sync.Once
@@ -40,6 +42,8 @@ type SSESession struct {
 	mu      sync.Mutex
 	postURL string
 	connErr error
+	closed  bool
+	cancel  context.CancelFunc
 	reqID   int
 	pending map[int]chan *probe.RawResult
 }
@@ -54,10 +58,36 @@ func NewSSESession(sseURL, authHeader string, client *httpx.Client) (*SSESession
 	return &SSESession{
 		sseURL:     sseURL,
 		authHeader: authHeader,
+		client:     client,
 		httpClient: &streaming,
 		ready:      make(chan struct{}),
 		pending:    make(map[int]chan *probe.RawResult),
 	}, nil
+}
+
+// AnonymousSession opens a separate SSE stream and POST channel with no
+// credentials. The authenticated long-lived stream cannot be made anonymous
+// after its handshake, so a fresh connection is the only faithful way to
+// observe what an anonymous caller sees.
+func (s *SSESession) AnonymousSession() (probe.Session, error) {
+	return NewSSESession(s.sseURL, "", s.client)
+}
+
+// Close stops the persistent SSE stream and releases its goroutine. It is
+// safe to call more than once.
+func (s *SSESession) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 func (s *SSESession) TargetURL() string { return s.sseURL }
@@ -68,7 +98,16 @@ func (s *SSESession) TargetURL() string { return s.sseURL }
 // first caller does any work, everyone else just waits on s.ready.
 func (s *SSESession) connect(ctx context.Context) error {
 	s.connOnce.Do(func() {
-		go s.runStream(ctx)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			s.failConnect(errors.New("SSE session is closed"))
+			return
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		s.cancel = cancel
+		s.mu.Unlock()
+		go s.runStream(streamCtx)
 	})
 	select {
 	case <-s.ready:

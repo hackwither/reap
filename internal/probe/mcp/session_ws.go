@@ -41,6 +41,7 @@ const (
 // frame's JSON-RPC id.
 type WSSession struct {
 	targetURL string
+	client    *httpx.Client
 	conn      net.Conn
 	writeMu   sync.Mutex
 
@@ -67,11 +68,25 @@ func NewWSSession(targetURL, authHeader string, client *httpx.Client) (*WSSessio
 	}
 	s := &WSSession{
 		targetURL: targetURL,
+		client:    client,
 		conn:      conn,
 		pending:   make(map[int]chan *probe.RawResult),
 	}
 	go s.runReader()
 	return s, nil
+}
+
+// AnonymousSession establishes a separate WebSocket handshake with no
+// credentials. WithNoAuth cannot change the credentials of an
+// already-upgraded socket — WS authentication happens during the handshake —
+// so the only way to observe an anonymous caller is a fresh connection.
+func (s *WSSession) AnonymousSession() (probe.Session, error) {
+	return NewWSSession(s.targetURL, "", s.client)
+}
+
+// Close releases the upgraded connection and stops the background reader.
+func (s *WSSession) Close() error {
+	return s.conn.Close()
 }
 
 func (s *WSSession) TargetURL() string { return s.targetURL }

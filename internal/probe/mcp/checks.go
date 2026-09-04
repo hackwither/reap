@@ -61,6 +61,57 @@ func reproBody(method string, params any) string {
 var httpOnlyTransports = []string{"http-streamable", "http-sse-legacy"}
 var anyTransport = []string{"*"}
 
+// anonymousSessionProvider is implemented by session types that can hand back
+// a separate, credential-free connection. WithNoAuth only omits a per-request
+// Authorization header; it cannot undo authenticated transport state that is
+// established out-of-band (a WebSocket upgrade authenticated at handshake, a
+// captured Mcp-Session-Id, a long-lived authenticated SSE stream). Probes that
+// report "unauthenticated exposure" must observe it over one of these fresh
+// sessions, never over the authenticated session with the header suppressed.
+type anonymousSessionProvider interface {
+	AnonymousSession() (probe.Session, error)
+}
+
+func anonymousSession(s probe.Session) (probe.Session, error) {
+	provider, ok := s.(anonymousSessionProvider)
+	if !ok {
+		return nil, fmt.Errorf("session does not support a separate anonymous connection")
+	}
+	return provider.AnonymousSession()
+}
+
+// closeSession releases persistent transport state when a probe created a
+// separate anonymous session. Streamable HTTP needs no explicit cleanup;
+// WebSocket and legacy-SSE sessions keep a connection or goroutine open.
+func closeSession(s probe.Session) {
+	if closer, ok := s.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+// anonymousInitializedSession returns a fresh anonymous session that has
+// completed the MCP initialize handshake, so an "unauthenticated exposure"
+// finding is observed exactly as a real anonymous client would: connect,
+// initialize, then enumerate. ok is false when an anonymous caller cannot get
+// that far — the transport can't present an anonymous connection, or the
+// anonymous handshake was rejected — in which case the surface is NOT reachable
+// anonymously and the caller must emit no finding. Spec-compliant
+// streamable-HTTP and legacy-SSE servers gate enumeration behind initialize
+// (and an Mcp-Session-Id the fresh session captures during that handshake),
+// so skipping it would under-report a genuinely open server. The caller owns
+// the returned session and must closeSession it.
+func anonymousInitializedSession(ctx context.Context, s probe.Session) (probe.Session, bool) {
+	unauthSess, err := anonymousSession(s)
+	if err != nil {
+		return nil, false
+	}
+	if _, _, err := InitializeSession(ctx, unauthSess); err != nil {
+		closeSession(unauthSess)
+		return nil, false
+	}
+	return unauthSess, true
+}
+
 // streamableHTTPOnly is for probes that depend on a mechanism specific to
 // the streamable-HTTP session implementation (e.g. the Mcp-Session-Id
 // response header it captures) that has no equivalent in legacy-SSE or
@@ -150,8 +201,19 @@ func (p *oauthMetadataPostureProbe) Transports() []string { return httpOnlyTrans
 //     signal that must not be reported as "published but incomplete."
 func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
 	// --- Bearer challenge: observed on the resource's own 401, not metadata. ---
-	unauthRaw, unauthErr := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
-	sawChallenge := unauthErr == nil && unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
+	// A fresh anonymous connection, not WithNoAuth on the authenticated
+	// session — the whole point is the challenge an unauthenticated caller
+	// gets, and reused transport state (a WebSocket authenticated at its
+	// upgrade) would mask it. Deliberately no initialize handshake here: we
+	// want the server's raw 401 challenge on an unauthenticated tools/list.
+	// This probe only runs on HTTP transports, so a missing anonymous session
+	// just means "skip the challenge check," not a WS anonymous-dial failure.
+	var unauthRaw *probe.RawResult
+	if unauthSess, sessErr := anonymousSession(s); sessErr == nil {
+		defer closeSession(unauthSess)
+		unauthRaw, _ = unauthSess.Do(ctx, "tools/list", map[string]any{})
+	}
+	sawChallenge := unauthRaw != nil && unauthRaw.StatusCode == http.StatusUnauthorized
 	if sawChallenge {
 		wwwAuth := unauthRaw.Headers.Get("WWW-Authenticate")
 		if !strings.Contains(strings.ToLower(wwwAuth), "bearer") {
@@ -561,10 +623,18 @@ func (p *unauthToolsListProbe) Protocol() string     { return "mcp" }
 func (p *unauthToolsListProbe) Transports() []string { return anyTransport }
 
 func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	// Re-issue tools/list explicitly WITHOUT the auth header, regardless of
-	// whether the initial handshake used one. This answers the specific
-	// question: "can an anonymous caller enumerate tools?"
-	raw, err := s.Do(ctx, "tools/list", map[string]any{}, probe.WithNoAuth())
+	// Answer the specific question "can an anonymous caller enumerate tools?"
+	// over a fresh, unauthenticated connection — never by suppressing the
+	// header on the authenticated session. WithNoAuth cannot undo transport
+	// state established out-of-band (a WebSocket authenticated at its upgrade,
+	// a captured Mcp-Session-Id), which would let an authenticated tool list
+	// be reported as anonymous exposure.
+	unauthSess, ok := anonymousInitializedSession(ctx, s)
+	if !ok {
+		return nil // no anonymous connection possible / handshake rejected — nothing exposed
+	}
+	defer closeSession(unauthSess)
+	raw, err := unauthSess.Do(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil // network failure is not a finding; leave silent, CLI logs errors separately
 	}
@@ -856,8 +926,17 @@ func (p *resourcesPromptsExposureProbe) Protocol() string     { return "mcp" }
 func (p *resourcesPromptsExposureProbe) Transports() []string { return anyTransport }
 
 func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
+	// A fresh anonymous session (not WithNoAuth on the authenticated one) so
+	// no credential or inherited transport state can make an authenticated
+	// listing look anonymous. On transports that gate enumeration behind
+	// initialize, the shared helper runs that handshake first.
+	unauthSess, ok := anonymousInitializedSession(ctx, s)
+	if !ok {
+		return nil
+	}
+	defer closeSession(unauthSess)
 	for _, method := range []string{"resources/list", "prompts/list"} {
-		raw, err := s.Do(ctx, method, map[string]any{}, probe.WithNoAuth())
+		raw, err := unauthSess.Do(ctx, method, map[string]any{})
 		if err != nil || raw.StatusCode != 200 {
 			continue
 		}
@@ -1280,7 +1359,24 @@ func (p *authPostureProbe) Protocol() string     { return "mcp" }
 func (p *authPostureProbe) Transports() []string { return anyTransport }
 
 func (p *authPostureProbe) Run(ctx context.Context, s probe.Session, r *report.Report) error {
-	anon, err := listAll(ctx, s, "tools/list", "tools", probe.WithNoAuth())
+	// Determine anonymous reach over a fresh, unauthenticated connection.
+	// WithNoAuth on the authenticated session cannot undo transport state
+	// bound at connect time (a WebSocket authenticated during its upgrade),
+	// which would otherwise report a credentialed tool listing as "open."
+	unauthSess, sessErr := anonymousSession(s)
+	if sessErr != nil {
+		// No anonymous connection can be formed at all — e.g. a WebSocket
+		// whose credentials are bound to the handshake refused an anonymous
+		// upgrade. That is the answer: an anonymous caller cannot enumerate.
+		r.Target.AuthState = report.AuthStateGated
+		if authed, authErr := listAll(ctx, s, "tools/list", "tools"); authErr == nil && authed.OK() {
+			r.Target.AuthState = report.AuthStateAuthed
+		}
+		return nil
+	}
+	defer closeSession(unauthSess)
+
+	anon, err := listAll(ctx, unauthSess, "tools/list", "tools")
 	if err != nil {
 		r.Target.AuthState = report.AuthStateUnreached
 		return fmt.Errorf("anonymous tools/list failed: %w", err)

@@ -95,6 +95,14 @@ func NewSession(url, authHeader string, client *httpx.Client) *Session {
 	}
 }
 
+// AnonymousSession returns a fresh streamable-HTTP session with no
+// authentication and no inherited Mcp-Session-Id. It is intentionally
+// separate from Do(WithNoAuth): an anonymous probe must not reuse the
+// session id captured during an authenticated handshake.
+func (s *Session) AnonymousSession() (probe.Session, error) {
+	return NewSession(s.url, "", s.client), nil
+}
+
 func (s *Session) TargetURL() string { return s.url }
 
 // SessionID is the Mcp-Session-Id observed during the handshake, if any.

@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/hackwither/reap/internal/httpx"
 	"github.com/hackwither/reap/internal/probe"
+	"github.com/hackwither/reap/internal/probe/common"
 	"github.com/hackwither/reap/internal/report"
 	"github.com/hackwither/reap/internal/version"
 )
@@ -548,5 +551,145 @@ func TestOAuthMetadataPostureProbe_BearerCheckedOnProtectedResource(t *testing.T
 	}
 	if len(rep.Findings) != 1 || rep.Findings[0].ID != "mcp-oauth-bearer-challenge-missing" {
 		t.Fatalf("expected exactly the bearer-challenge-missing finding, got %d: %+v", len(rep.Findings), rep.Findings)
+	}
+}
+
+// --- unauthenticated-exposure transport-state regression ----------------
+
+// authRequiredWSServer completes a WebSocket upgrade ONLY when the request
+// carries the right Authorization header (auth is bound to the handshake, as
+// on a real WS transport), then answers initialize + tools/list over the
+// upgraded socket.
+func authRequiredWSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		key := r.Header.Get("Sec-WebSocket-Key")
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + common.ExpectedWebSocketAccept(key) + "\r\n\r\n")
+		_ = buf.Flush()
+		reader := bufio.NewReader(buf)
+		for {
+			fin, opcode, payload, err := readWSFrame(reader)
+			if err != nil {
+				return
+			}
+			if !fin || opcode != wsOpText {
+				continue
+			}
+			var req struct {
+				ID     int    `json:"id"`
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(payload, &req) != nil {
+				continue
+			}
+			result := map[string]any{}
+			switch req.Method {
+			case "initialize":
+				result = map[string]any{"protocolVersion": SupportedProtocolVersions[0], "serverInfo": map[string]any{"name": "auth-ws"}, "capabilities": map[string]any{}}
+			case "tools/list":
+				result = map[string]any{"tools": []map[string]any{{"name": "secret_tool"}}}
+			}
+			resp, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+			if writeServerWSFrame(conn, wsOpText, resp) != nil {
+				return
+			}
+		}
+	}))
+}
+
+// TestUnauthToolsListProbeDoesNotReuseAuthenticatedWebSocket is the
+// false-positive guard for issue #1: on a WebSocket, auth is established at the
+// upgrade, so WithNoAuth on the authenticated session cannot make a request
+// anonymous. The probe must open a SEPARATE anonymous connection — which this
+// server refuses — and therefore report nothing, rather than passing off the
+// authenticated tool list as anonymous exposure.
+func TestUnauthToolsListProbeDoesNotReuseAuthenticatedWebSocket(t *testing.T) {
+	srv := authRequiredWSServer(t)
+	defer srv.Close()
+	wsURL := "ws" + srv.URL[len("http"):]
+
+	sess, err := NewWSSession(wsURL, "Bearer secret", testClient(t))
+	if err != nil {
+		t.Fatalf("authenticated websocket handshake failed: %v", err)
+	}
+	defer sess.conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if init, _, err := InitializeSession(ctx, sess); err != nil || init == nil {
+		t.Fatalf("authenticated initialize failed: %v", err)
+	}
+	raw, err := sess.Do(ctx, "tools/list", map[string]any{})
+	if err != nil || raw.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated tools/list failed: status=%d err=%v", raw.StatusCode, err)
+	}
+
+	rep := newReport(wsURL)
+	if err := (&unauthToolsListProbe{}).Run(ctx, sess, rep); err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(rep.Findings) != 0 {
+		t.Fatalf("authenticated websocket response was reported as anonymous exposure: %+v", rep.Findings)
+	}
+}
+
+// TestUnauthToolsListProbeStillDetectsAnonymousStreamable is the positive
+// counterpart: a spec-compliant streamable-HTTP server gates tools/list behind
+// an initialize round trip and an Mcp-Session-Id the caller must echo. It needs
+// no auth, so the tool list IS anonymously reachable and the probe MUST emit a
+// finding. Without the anonymous initialize the fresh session would send
+// tools/list with no session id, be rejected, and a genuinely open server would
+// be silently under-reported (a false negative).
+func TestUnauthToolsListProbeStillDetectsAnonymousStreamable(t *testing.T) {
+	const sessionID = "anon-session-1"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", sessionID)
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": SupportedProtocolVersions[0], "serverInfo": map[string]any{"name": "anon-gateway", "version": "1.0"}, "capabilities": map[string]any{}}})
+		case "tools/list":
+			if r.Header.Get("Mcp-Session-Id") != sessionID {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": "missing session id"}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"tools": []map[string]any{{"name": "read_file"}}}})
+		default:
+			// notifications/initialized and anything else: accept silently.
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	rep := newReport(srv.URL)
+	if err := (&unauthToolsListProbe{}).Run(context.Background(), testSession(t, srv.URL), rep); err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(rep.Findings) != 1 {
+		t.Fatalf("expected 1 anonymous-exposure finding for an initialize-gated open server, got %d: %+v", len(rep.Findings), rep.Findings)
+	}
+	if rep.Findings[0].ID != "mcp-unauth-tools-list" {
+		t.Fatalf("expected mcp-unauth-tools-list, got %q", rep.Findings[0].ID)
 	}
 }
