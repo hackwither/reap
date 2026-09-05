@@ -62,15 +62,3 @@ release:
     name: reap
   draft: false
   prerelease: auto
-
-homebrew_casks:
-  - name: reap
-    binaries:
-      - reap
-    repository:
-      owner: hackwither
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    directory: Casks
-    homepage: "https://github.com/hackwither/reap"
-    description: "Reconnaissance and Enumeration for Agent Protocols — active recon for MCP and other AI agent endpoints"
