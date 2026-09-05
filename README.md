@@ -14,7 +14,7 @@
  <!-- <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release"> -->
 </p>
 
-**REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL — or a bare `host:port` — that you're authorized to test, and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
+**REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL or a bare `host:port` that you're authorized to test, and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
 
 <img width="1080" height="600" alt="reap_video-6" src="https://github.com/user-attachments/assets/fe5cf8f2-c584-4476-9353-99eb50c619f9" />
 
