@@ -19,8 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -94,14 +94,21 @@ type Matcher struct {
 // skipping (and reporting) any file that fails to parse rather than
 // aborting the whole load — one bad template shouldn't take down a scan.
 func LoadDir(dir string) ([]*Template, []error) {
+	return LoadFS(os.DirFS(dir))
+}
+
+// LoadFS loads every .json template reachable from the root of fsys. It backs
+// both the on-disk loader (os.DirFS) and the binary's embedded template set,
+// so a `go install`'d reap ships with its built-ins and needs no checkout.
+func LoadFS(fsys fs.FS) ([]*Template, []error) {
 	var templates []*Template
 	var errs []error
 
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".json") {
+	_ = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".json") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		data, err := fs.ReadFile(fsys, path)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", path, err))
 			return nil

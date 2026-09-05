@@ -57,7 +57,7 @@ cd reap && go build -o bin/reap ./cmd/reap
 ```
 
 Requires Go 1.22+. No other dependencies.
-> `go install` places only the binary on your path. REAP loads templates and fingerprints from disk at startup, so point `--templates` and `--fingerprints` at a checkout, or use a release archive or the Docker image, both of which bundle them.
+> The built-in templates and fingerprints are embedded in the binary, so a `go install`'d REAP works with no checkout on disk. Point `--templates` / `--fingerprints` at a directory to load your own on top of the built-ins, or pass an empty string to disable the built-in set.
 
 ## Quick start
 
@@ -214,7 +214,7 @@ REAP negotiates MCP protocol versions `2025-06-18`, `2025-03-26`, and `2024-11-0
 
 ## Writing your own checks
 
-Drop a JSON template in `templates/`, no Go, no rebuild:
+Drop a JSON template in a directory and point `--templates` at it — no Go, no rebuild. It loads alongside the built-in set embedded in the binary:
 
 ```json
 {

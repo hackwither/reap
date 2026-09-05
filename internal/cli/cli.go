@@ -33,7 +33,16 @@ import (
 	"github.com/hackwither/reap/internal/report"
 	"github.com/hackwither/reap/internal/template"
 	"github.com/hackwither/reap/internal/version"
+
+	embeddedFingerprints "github.com/hackwither/reap/fingerprints"
+	embeddedTemplates "github.com/hackwither/reap/templates"
 )
+
+// embeddedSource is the sentinel --templates/--fingerprints value that loads
+// reap's built-in set from the binary itself rather than from disk. It is the
+// default so a `go install`'d reap works with no checkout; pass a directory to
+// override, or "" to disable.
+const embeddedSource = "embedded"
 
 // Exit codes. These are part of reap's contract with CI systems, so they are
 // named rather than sprinkled as literals.
@@ -384,9 +393,14 @@ func Run(args []string, stdout, stderr *os.File) int {
 	for _, p := range transport.BuiltinProbes(opts.client) {
 		reg.Register(p)
 	}
-	tmplDir := opts.TemplatesDir
-	if tmplDir != "" {
-		templates, loadErrs := template.LoadDir(tmplDir)
+	if tmplDir := opts.TemplatesDir; tmplDir != "" {
+		var templates []*template.Template
+		var loadErrs []error
+		if tmplDir == embeddedSource {
+			templates, loadErrs = template.LoadFS(embeddedTemplates.FS)
+		} else {
+			templates, loadErrs = template.LoadDir(tmplDir)
+		}
 		for _, e := range loadErrs {
 			fmt.Fprintf(stderr, "[template load error] %v\n", e)
 		}
@@ -605,8 +619,14 @@ func buildDiscoveryRegistry(opts *Options, stderr *os.File) *discovery.Registry 
 	for _, d := range discovery.BuiltinDetectors() {
 		dreg.Register(d)
 	}
-	if opts.FingerprintsDir != "" {
-		fingerprints, loadErrs := discovery.LoadFingerprintDir(opts.FingerprintsDir)
+	if fpDir := opts.FingerprintsDir; fpDir != "" {
+		var fingerprints []*discovery.FingerprintTemplate
+		var loadErrs []error
+		if fpDir == embeddedSource {
+			fingerprints, loadErrs = discovery.LoadFingerprintFS(embeddedFingerprints.FS)
+		} else {
+			fingerprints, loadErrs = discovery.LoadFingerprintDir(fpDir)
+		}
 		for _, e := range loadErrs {
 			fmt.Fprintf(stderr, "[fingerprint load error] %v\n", e)
 		}
@@ -1040,8 +1060,8 @@ func parseFlags(args []string) (*Options, *flag.FlagSet, error) {
 	fs.BoolVar(&o.ListDetectors, "list-detectors", false, "list discovery detectors and exit")
 	fs.StringVar(&o.AuthHeader, "auth-header", "", `optional Authorization header value to send, e.g. "Bearer xyz"`)
 	fs.DurationVar(&o.Timeout, "timeout", 10*time.Second, "per-request timeout")
-	fs.StringVar(&o.TemplatesDir, "templates", "templates", "directory of JSON probe templates (empty string to disable)")
-	fs.StringVar(&o.FingerprintsDir, "fingerprints", "fingerprints", "directory of JSON discovery fingerprints (empty string to disable)")
+	fs.StringVar(&o.TemplatesDir, "templates", embeddedSource, `directory of JSON probe templates ("embedded" for built-ins, empty string to disable)`)
+	fs.StringVar(&o.FingerprintsDir, "fingerprints", embeddedSource, `directory of JSON discovery fingerprints ("embedded" for built-ins, empty string to disable)`)
 	fs.StringVar(&o.Output, "output", "text", "output format: text|json|sarif (JSON is NDJSON in batch mode)")
 	fs.StringVar(&o.OutFile, "out", "", "write report to file in addition to stdout")
 	fs.BoolVar(&o.Verbose, "v", false, "verbose output")

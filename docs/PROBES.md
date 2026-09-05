@@ -1,6 +1,6 @@
 # Probes
 
-Reap ships 16 built-in MCP probes: 15 hand-written Go probes (`internal/probe/mcp/checks.go`, `server_header.go`) registered via `BuiltinProbes()`, plus 1 declarative JSON template probe (`templates/mcp/high-risk-tool-names.json`) loaded at runtime from `--templates` (default `templates/`). See [WRITING_PROBES.md](WRITING_PROBES.md) for how to add more.
+Reap ships 16 built-in MCP probes: 15 hand-written Go probes (`internal/probe/mcp/checks.go`, `server_header.go`) registered via `BuiltinProbes()`, plus 1 declarative JSON template probe (`templates/mcp/high-risk-tool-names.json`) embedded in the binary from `templates/` at build time (default `--templates embedded`; point the flag at a directory to load your own on top). See [WRITING_PROBES.md](WRITING_PROBES.md) for how to add more.
 
 ## Basis: OWASP ASI
 

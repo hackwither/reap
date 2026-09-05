@@ -18,9 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,14 +62,22 @@ type FingerprintTemplate struct {
 // parsed set, skipping (and reporting) any file that fails to parse rather
 // than aborting the whole load — mirrors template.LoadDir exactly.
 func LoadFingerprintDir(dir string) ([]*FingerprintTemplate, []error) {
+	return LoadFingerprintFS(os.DirFS(dir))
+}
+
+// LoadFingerprintFS loads every .json fingerprint reachable from the root of
+// fsys. It backs both the on-disk loader (os.DirFS) and the binary's embedded
+// fingerprint set, so a `go install`'d reap can identify protocols with no
+// checkout on disk.
+func LoadFingerprintFS(fsys fs.FS) ([]*FingerprintTemplate, []error) {
 	var out []*FingerprintTemplate
 	var errs []error
 
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".json") {
+	_ = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".json") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		data, err := fs.ReadFile(fsys, path)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", path, err))
 			return nil
