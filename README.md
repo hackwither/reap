@@ -22,11 +22,11 @@
 
 ## Why REAP exists
 
-The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty program just put in scope. The internal service someone stood up behind a load balancer with `allowedOrigins: ["*"]` and forgot about. That's what REAP does: external, unauthenticated, black-box recon against a live agent endpoint, from the position an actual attacker occupies.
+The MCP gateway your team shipped last sprint, to the agent endpoint a bug bounty program just put in scope. That's what REAP is for: external, unauthenticated, black-box recon against a live agent endpoint, from the position an actual attacker occupies.
 
 ## What makes it different
 
-**It reads, it never invokes** This is enforced architecturally, not by convention. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool — or even to send a notification. There is no code path in REAP that sends `tools/call`, on any transport, from any built-in probe or user-supplied template. A scanner that executes what it finds on an agent endpoint isn't a scanner, it's an agent. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
+**It reads, never invokes** This is enforced architecturally. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool or even to send a notification. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
 
 **It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS. REAP checks the things that only make sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to.
 
@@ -34,7 +34,7 @@ The MCP gateway your team shipped last sprint. The agent endpoint a bug bounty p
 
 **It's built for pipelines and CI** Text for humans, NDJSON for pipelines, SARIF 2.1.0 for GitHub Advanced Security. `--fail-on` gates a build on severity; findings, usage errors, and incomplete scans each get their own exit code. Single static Go binary, zero third-party dependencies, no API key, no telemetry, nothing leaves your machine except the requests you asked for.
 
-**It's designed to outlive MCP** MCP is the only protocol with enumeration probes today. But every transport and TLS check is protocol-neutral, discovery already identifies A2A agent cards and OpenAPI services, and those targets get a real report — identification plus full transport posture — with no MCP involved.
+**It's designed to outlive MCP** MCP is the only protocol with enumeration probes today. But every transport and TLS check is protocol-neutral, discovery already identifies A2A agent cards and OpenAPI services, and those targets get a real report, identification plus full transport posture with no MCP involved.
 
 ## Install
 
@@ -113,7 +113,7 @@ reap -t "$MCP_ENDPOINT" --authorized --output sarif --out reap.sarif --fail-on h
 
 ## Discovery: "is there an agent here at all?"
 
-Point `-t` at a URL without knowing the protocol, and `--protocol auto` figures out whether — and how — it speaks MCP before running a single security check:
+Point `-t` at a URL without knowing the protocol, and `--protocol auto` figures out whether and how it speaks MCP before running a single security check:
 
 ```sh
 reap -t https://maybe-an-mcp-host.example --protocol auto --authorized
@@ -128,9 +128,9 @@ This is the fix for the single biggest trust-killer a recon tool can have: firin
   reflect a generic web server, not a real MCP handshake.
 ```
 
-`--mode=discover` runs Discovery only (no enumeration/assessment) and prints the resolved `Fingerprint` — protocol, transport, confidence, server metadata — for every target. `--list-detectors` lists the registered detectors, the discovery-time sibling of `--list-probes`.
+`--mode=discover` runs Discovery only (no enumeration/assessment) and prints the resolved `Fingerprint` [protocol, transport, confidence, server metadata] for every target. `--list-detectors` lists the registered detectors, the discovery-time sibling of `--list-probes`.
 
-Discovered/assumed transport also picks which `Session` implementation actually runs the scan: streamable-HTTP, legacy pre-2025-03-26 HTTP+SSE, or a raw WebSocket (non-standard, but observed in some community gateways) — each behind the same `Session` interface and the same no-invoke boundary, so every existing probe and template runs unmodified regardless of which one it lands on.
+Discovered/assumed transport also picks which `Session` implementation actually runs the scan: streamable-HTTP, legacy pre-2025-03-26 HTTP+SSE, or a raw WebSocket (non-standard, but observed in some community gateways), each behind the same `Session` interface and the same no-invoke boundary, so every existing probe and template runs unmodified regardless of which one it lands on.
 
 ## Output
 
@@ -159,11 +159,11 @@ reap report — http://10.0.0.7:8080/mcp
 | `0` | Scan ran; nothing at or above `--fail-on` |
 | `1` | Findings at or above `--fail-on` (unset means never) |
 | `2` | Usage or validation error |
-| `3` | Scan could not complete — findings are not a negative result |
+| `3` | Scan could not complete, findings are not a negative result |
 
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10) — see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
 
 ### Recon: what is this endpoint, and what will it tell a stranger?
 
@@ -186,7 +186,7 @@ Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10) — s
 | `mcp-session-id-entropy` | Weak or predictable session identifiers (the value itself is never recorded) |
 | `mcp-host-header-validation` | Servers not validating `Host` during `initialize` (DNS rebinding) |
 
-### Transport posture — runs against every protocol
+### Transport posture: runs against every protocol
 
 These report `protocol=*` and apply to any endpoint REAP can identify, including ones with no enumeration probes yet.
 
@@ -214,7 +214,7 @@ REAP negotiates MCP protocol versions `2025-06-18`, `2025-03-26`, and `2024-11-0
 
 ## Writing your own checks
 
-Drop a JSON template in a directory and point `--templates` at it — no Go, no rebuild. It loads alongside the built-in set embedded in the binary:
+Drop a JSON template in a directory and point `--templates` at it, no Go, no rebuild. It loads alongside the built-in set embedded in the binary:
 
 ```json
 {
@@ -250,8 +250,6 @@ reap -t http://127.0.0.1:8765/mcp --authorized
 python3 scripts/strict_mcp_server.py &        # pedantic: old spec revision, paginated, strict handshake
 reap -t http://127.0.0.1:8099/mcp --authorized
 ```
-
-The strict fixture is the more useful of the two — it only answers a client that negotiates protocol versions, sends `notifications/initialized`, carries the protocol header, and follows `nextCursor`.
 
 ## Roadmap
 
