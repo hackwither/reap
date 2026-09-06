@@ -420,7 +420,16 @@ func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *re
 	return nil
 }
 
+const maxRedirectURIDepth = 10
+
 func findRedirectURIs(value any) []string {
+	return findRedirectURIsAt(value, 0)
+}
+
+func findRedirectURIsAt(value any, depth int) []string {
+	if depth > maxRedirectURIDepth {
+		return nil
+	}
 	out := []string{}
 	switch v := value.(type) {
 	case map[string]any:
@@ -437,11 +446,11 @@ func findRedirectURIs(value any) []string {
 					}
 				}
 			}
-			out = append(out, findRedirectURIs(child)...)
+			out = append(out, findRedirectURIsAt(child, depth+1)...)
 		}
 	case []any:
 		for _, item := range v {
-			out = append(out, findRedirectURIs(item)...)
+			out = append(out, findRedirectURIsAt(item, depth+1)...)
 		}
 	}
 	return out
@@ -455,16 +464,24 @@ func isBroadRedirectURI(target string) bool {
 	if err != nil {
 		return true
 	}
-	if parsed.Scheme != "https" {
+	switch parsed.Scheme {
+	case "https":
+		// Require a non-empty host and a path deeper than "/".
+		return parsed.Host == "" || parsed.Path == "" || parsed.Path == "/"
+	case "http":
+		// RFC 8252 §8.3 permits http://localhost (and 127.0.0.1/::1) for
+		// loopback redirect URIs in native apps. Flag everything else.
+		h := parsed.Hostname()
+		if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+			return false
+		}
 		return true
+	default:
+		// Any other scheme (myapp://callback, urn:ietf:...) is a native-app
+		// custom URI scheme, which RFC 8252 explicitly allows. Empty scheme
+		// means a relative or malformed URI — flag it.
+		return parsed.Scheme == ""
 	}
-	if parsed.Host == "" {
-		return true
-	}
-	if parsed.Path == "" || parsed.Path == "/" {
-		return true
-	}
-	return false
 }
 
 // --- session-id-entropy -------------------------------------------------
