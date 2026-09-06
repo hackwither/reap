@@ -477,6 +477,12 @@ func isBroadRedirectURI(target string) bool {
 		}
 		return true
 	default:
+		// javascript:, data:, vbscript: are code-injection vectors, not
+		// redirect URIs — flag them regardless of what the rest looks like.
+		switch parsed.Scheme {
+		case "javascript", "data", "vbscript":
+			return true
+		}
 		// Any other scheme (myapp://callback, urn:ietf:...) is a native-app
 		// custom URI scheme, which RFC 8252 explicitly allows. Empty scheme
 		// means a relative or malformed URI — flag it.
