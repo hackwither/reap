@@ -127,11 +127,9 @@ func (p *tlsCertHealthProbe) Run(ctx context.Context, s probe.Session, r *report
 		issues = append(issues, "certificate is not yet valid")
 		raise(report.SeverityHigh)
 	}
-	if cert.IsCA {
-		if err := cert.CheckSignatureFrom(cert); err == nil {
-			issues = append(issues, "certificate is self-signed")
-			raise(report.SeverityHigh)
-		}
+	if cert.Issuer.String() == cert.Subject.String() {
+		issues = append(issues, "certificate is self-signed")
+		raise(report.SeverityHigh)
 	}
 	if err := cert.VerifyHostname(u.Hostname()); err != nil {
 		issues = append(issues, fmt.Sprintf("hostname mismatch: %v", err))
@@ -258,6 +256,12 @@ func (p *corsWildcardProbe) Run(ctx context.Context, s probe.Session, r *report.
 		// browsers permit credentials with a reflected origin.
 		desc = fmt.Sprintf("Server reflects an arbitrary request Origin (%s) back in Access-Control-Allow-Origin, which permits credentialed cross-origin access from any site.", probeOrigin)
 		sev = report.SeverityHigh
+		// IsCORSWildcard only sets credentialed when acao=="*"; check the
+		// header independently so the credentials detail appears when the
+		// origin is reflected rather than wildcarded.
+		if strings.EqualFold(headers.Get("Access-Control-Allow-Credentials"), "true") {
+			desc += " The server also sends Access-Control-Allow-Credentials: true, allowing cookies and auth headers to be included in cross-origin requests from any site."
+		}
 	}
 	if credentialed {
 		sev = report.SeverityHigh
