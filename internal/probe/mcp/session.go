@@ -78,7 +78,7 @@ type Session struct {
 	initResult        *InitializeResult
 	initRaw           *probe.RawResult
 	initErr           error
-	initDone          bool
+	initOnce          sync.Once
 	reqID             int
 	// cache memoises identical read requests within one scan. Fourteen probes
 	// previously issued thirteen requests per scan, nine of them the same
@@ -336,27 +336,26 @@ func initializeParams(protocolVersion string) map[string]any {
 // notifications/initialized. The result is memoised: several probes want the
 // handshake response, and re-handshaking per probe both wastes requests and
 // churns the server's session state.
+//
+// sync.Once guarantees exactly one handshake even when multiple goroutines
+// call Initialize concurrently, closing the TOCTOU window that existed when
+// the previous check-unlock-handshake pattern allowed two goroutines to race
+// through the nil check simultaneously.
 func (s *Session) Initialize(ctx context.Context) (*InitializeResult, *probe.RawResult, error) {
-	s.mu.Lock()
-	if s.initDone {
-		res, raw, err := s.initResult, s.initRaw, s.initErr
+	s.initOnce.Do(func() {
+		res, raw, err := s.handshake(ctx)
+		s.mu.Lock()
+		s.initResult, s.initRaw, s.initErr = res, raw, err
 		s.mu.Unlock()
-		return res, raw, err
-	}
-	s.mu.Unlock()
-
-	res, raw, err := s.handshake(ctx)
-
+		if err == nil {
+			// Best effort: a server that doesn't care won't mind, and one that
+			// does will reject everything downstream without it.
+			_ = s.notify(ctx, "notifications/initialized", nil)
+		}
+	})
 	s.mu.Lock()
-	s.initDone = true
-	s.initResult, s.initRaw, s.initErr = res, raw, err
+	res, raw, err := s.initResult, s.initRaw, s.initErr
 	s.mu.Unlock()
-
-	if err == nil {
-		// Best effort: a server that doesn't care won't mind, and one that
-		// does will reject everything downstream without it.
-		_ = s.notify(ctx, "notifications/initialized", nil)
-	}
 	return res, raw, err
 }
 
