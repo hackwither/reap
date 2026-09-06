@@ -11,9 +11,9 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 
+	"github.com/hackwither/reap/internal/httpx"
 	"github.com/hackwither/reap/internal/probe"
 	"github.com/hackwither/reap/internal/report"
 )
@@ -25,14 +25,14 @@ import (
 // byte of MCP. They now live in internal/probe/transport with
 // Protocol() == "*", so they apply to every protocol reap can identify —
 // including A2A and OpenAPI, which have no enumeration probes yet.
-func BuiltinProbes() []probe.Probe {
+func BuiltinProbes(client *httpx.Client) []probe.Probe {
 	return []probe.Probe{
 		&authPostureProbe{},
 		&unauthToolsListProbe{},
 		&toolCapabilitySurfaceProbe{},
 		&hostHeaderValidationProbe{},
-		&oauthMetadataPostureProbe{},
-		&redirectUriLaxityProbe{},
+		&oauthMetadataPostureProbe{client: client},
+		&redirectUriLaxityProbe{client: client},
 		&sessionIDEntropyProbe{},
 		&instructionsExposureProbe{},
 		&resourcesPromptsExposureProbe{},
@@ -178,7 +178,7 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 
 // --- oauth-metadata-posture --------------------------------------------
 
-type oauthMetadataPostureProbe struct{}
+type oauthMetadataPostureProbe struct{ client *httpx.Client }
 
 func (p *oauthMetadataPostureProbe) ID() string           { return "mcp-oauth-metadata-posture" }
 func (p *oauthMetadataPostureProbe) Protocol() string     { return "mcp" }
@@ -257,7 +257,7 @@ func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r 
 	var publishedContentType string
 
 	for _, pth := range paths {
-		metadata, headers, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
+		metadata, headers, status, err := fetchWellKnownJSON(ctx, p.client, baseURL, pth)
 		if err != nil || status != http.StatusOK || metadata == nil {
 			continue // 404 (or any non-200) means "not published," not "published but incomplete"
 		}
@@ -294,14 +294,12 @@ func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r 
 	return nil
 }
 
-func fetchWellKnownJSON(ctx context.Context, baseURL, path string) (map[string]any, http.Header, int, error) {
-	url := baseURL + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func fetchWellKnownJSON(ctx context.Context, client *httpx.Client, baseURL, path string) (map[string]any, http.Header, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := client.HTTP().Do(req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -359,7 +357,7 @@ func containsStringValue(value any, expected string) bool {
 
 // --- redirect-uri-laxity ------------------------------------------------
 
-type redirectUriLaxityProbe struct{}
+type redirectUriLaxityProbe struct{ client *httpx.Client }
 
 func (p *redirectUriLaxityProbe) ID() string           { return "mcp-redirect-uri-laxity" }
 func (p *redirectUriLaxityProbe) Protocol() string     { return "mcp" }
@@ -376,7 +374,7 @@ func (p *redirectUriLaxityProbe) Run(ctx context.Context, s probe.Session, r *re
 	var lastPath string
 	var lastStatus int
 	for _, pth := range paths {
-		metadata, _, status, err := fetchWellKnownJSON(ctx, baseURL, pth)
+		metadata, _, status, err := fetchWellKnownJSON(ctx, p.client, baseURL, pth)
 		if err != nil || status != http.StatusOK || metadata == nil {
 			continue // 404 (or any non-200) is "not published," not parseable metadata
 		}
