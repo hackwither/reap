@@ -442,6 +442,12 @@ func negotiateInitialize(ctx context.Context, sess probe.Session) (*InitializeRe
 		// error body happens to be valid JSON.
 		if raw.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("server returned HTTP %d for initialize (expected 200)", raw.StatusCode)
+			// 405 Method Not Allowed and 501 Not Implemented mean the server
+			// didn't recognise this HTTP method or protocol variant; try the
+			// next version regardless of whether the body contains "version".
+			if raw.StatusCode == http.StatusMethodNotAllowed || raw.StatusCode == http.StatusNotImplemented {
+				continue
+			}
 			if isVersionRejection(raw.StatusCode, string(raw.Body)) {
 				continue
 			}
