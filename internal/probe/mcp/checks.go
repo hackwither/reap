@@ -911,10 +911,11 @@ func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r 
 }
 
 func excerpt(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
 }
 
 // --- resources-prompts-exposure ---------------------------------------
