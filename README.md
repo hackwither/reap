@@ -18,7 +18,7 @@
 
 <img width="1080" height="600" alt="reap_video-6" src="https://github.com/user-attachments/assets/fe5cf8f2-c584-4476-9353-99eb50c619f9" />
 
-> **Use only against systems you own or are explicitly authorized to test.** `--authorized` is an acknowledgement, not an access control: REAP still runs without it, and prints a warning. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
+> **This illustration uses [reap-range](https://github.com/hackwither/reap-range) to demonstrate the capabilities of this tool. Use only against systems you own or are explicitly authorized to test.** `--authorized` is an acknowledgement, not an access control: REAP still runs without it, and prints a warning. Unauthorized access to computer systems is illegal in most jurisdictions even when every request is read-only. See [`SECURITY.md`](SECURITY.md).
 
 ## Why REAP exists
 
