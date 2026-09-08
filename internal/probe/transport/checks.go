@@ -82,7 +82,7 @@ func (p *plaintextProbe) Run(ctx context.Context, s probe.Session, r *report.Rep
 		Title:       "Agent endpoint served over plaintext HTTP",
 		Severity:    report.SeverityMedium,
 		Protocol:    "*",
-		ASI:         []string{"ASI04"},
+		ASI:         []string{"ASI07"},
 		Description: "Target URL uses http:// rather than https://. Tool calls, arguments, and any auth tokens are visible to on-path observers.",
 		Evidence:    map[string]any{"url": s.TargetURL()},
 		Remediation: "Serve agent endpoints over TLS only; redirect or refuse plaintext connections.",
@@ -213,7 +213,7 @@ func (p *downgradeProbe) Run(ctx context.Context, s probe.Session, r *report.Rep
 		Title:       "Endpoint also responds over plaintext HTTP",
 		Severity:    report.SeverityMedium,
 		Protocol:    "*",
-		ASI:         []string{"ASI04"},
+		ASI:         []string{"ASI07"},
 		Description: "The target host also accepted at least one plaintext HTTP path for agent traffic, which undermines TLS protections.",
 		Evidence:    map[string]any{"fallbacks": evidence},
 		Remediation: "Disable plaintext HTTP listeners for agent endpoints and accept traffic only over TLS.",
@@ -410,10 +410,9 @@ func (p *rateLimitProbe) Run(ctx context.Context, s probe.Session, r *report.Rep
 		Title:    "No standard rate-limit headers observed",
 		Severity: report.SeverityLow,
 		Protocol: "*",
-		// ASI06 (Cascading Failures) rather than ASI08 (Supply Chain), which
-		// this has nothing to do with. Missing rate limiting is a
-		// cascading-failure and availability concern.
-		ASI:         []string{"ASI06"},
+		// Missing rate limiting is a cascading-failure and availability
+		// concern: ASI08 (Cascading Failures) in the published v1.0 numbering.
+		ASI:         []string{"ASI08"},
 		Description: "The endpoint answered requests but sent no standard rate-limit response headers. This is a reconnaissance signal that the service may not be advertising rate limiting to clients; it is not proof that no limiting exists.",
 		Evidence:    map[string]any{"observations": observed},
 		Remediation: "Expose standard rate-limit headers such as Retry-After, RateLimit-Remaining, and RateLimit-Limit, or document the expected client behavior when limits are reached.",

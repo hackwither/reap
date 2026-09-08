@@ -4,7 +4,7 @@
   "info": {
     "title": "Tool list includes names suggesting code execution or filesystem access",
     "severity": "medium",
-    "asi_refs": ["ASI02", "ASI07"],
+    "asi_refs": ["ASI02", "ASI05"],
     "description": "The tool list (requested with credentials, if any were supplied) includes a tool name matching patterns associated with code-execution or raw-filesystem primitives. This is a triage signal for closer review; verify the tool's actual capabilities and authorization model.",
     "remediation": "Review tool capabilities in context. If the tool performs code execution or unrestricted filesystem access, scope it behind explicit, auditable authorization separate from general tool listing. Consider narrower alternatives.",
     "tags": ["tool-misuse", "excessive-agency"],

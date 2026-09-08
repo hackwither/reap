@@ -177,7 +177,7 @@ func TestRateLimitProbe(t *testing.T) {
 		}
 	})
 
-	t.Run("headers absent: reports at ASI06", func(t *testing.T) {
+	t.Run("headers absent: reports at ASI08", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -190,10 +190,10 @@ func TestRateLimitProbe(t *testing.T) {
 		if len(rep.Findings) != 1 {
 			t.Fatalf("expected 1 finding, got %v", rep.Findings)
 		}
-		// ASI08 (Supply Chain) was simply the wrong category for missing rate
-		// limiting; it is a cascading-failure concern.
-		if got := rep.Findings[0].ASI; len(got) != 1 || got[0] != "ASI06" {
-			t.Fatalf("expected ASI06, got %v", got)
+		// Missing rate limiting is a cascading-failure concern: ASI08 in the
+		// published v1.0 numbering (the draft table had it at ASI06).
+		if got := rep.Findings[0].ASI; len(got) != 1 || got[0] != "ASI08" {
+			t.Fatalf("expected ASI08, got %v", got)
 		}
 	})
 }

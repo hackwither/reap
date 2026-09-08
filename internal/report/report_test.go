@@ -310,6 +310,35 @@ func TestASITitles_AllTenPresent(t *testing.T) {
 	}
 }
 
+// TestASITitles_MatchPublishedV1 pins the table to the published OWASP Top 10
+// for Agentic Applications 2026 v1.0. The table previously followed an earlier
+// draft whose ASI04 to ASI09 carried different titles, and every asi_refs in
+// the probes was coded against that draft, so a drift here silently mislabels
+// every finding. A title change in the standard must change this test on
+// purpose, not the table by accident.
+func TestASITitles_MatchPublishedV1(t *testing.T) {
+	want := map[string]string{
+		"ASI01": "Agent Goal Hijack",
+		"ASI02": "Tool Misuse and Exploitation",
+		"ASI03": "Identity and Privilege Abuse",
+		"ASI04": "Agentic Supply Chain Vulnerabilities",
+		"ASI05": "Unexpected Code Execution (RCE)",
+		"ASI06": "Memory & Context Poisoning",
+		"ASI07": "Insecure Inter-Agent Communication",
+		"ASI08": "Cascading Failures",
+		"ASI09": "Human-Agent Trust Exploitation",
+		"ASI10": "Rogue Agents",
+	}
+	for id, title := range want {
+		if got := ASITitles[id]; got != title {
+			t.Errorf("%s: got %q, want %q (published v1.0)", id, got, title)
+		}
+	}
+	if len(ASITitles) != len(want) {
+		t.Errorf("ASITitles has %d entries, want %d", len(ASITitles), len(want))
+	}
+}
+
 func findingIDs(fs []Finding) []string {
 	out := make([]string, len(fs))
 	for i, f := range fs {
