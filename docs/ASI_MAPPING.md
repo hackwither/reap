@@ -17,17 +17,20 @@ REAP cites [OWASP Top 10 for Agentic Applications (2026)](https://genai.owasp.or
 | `mcp-redirect-uri-laxity` | ASI03 | Broad redirect registration enables confused-deputy and code-interception attacks against the agent's identity. |
 | `mcp-session-id-entropy` | ASI03 | A guessable session ID lets an attacker assume another caller's identity directly. |
 | `mcp-host-header-validation` | ASI03 | DNS rebinding lets a web page reach an agent endpoint and act with the victim's network position. |
-| `transport-plaintext` | ASI04 | Agent traffic, tool arguments, and bearer tokens readable on the wire. |
-| `transport-downgrade` | ASI04 | A plaintext listener on the same host defeats the TLS the endpoint otherwise offers. |
+| `transport-plaintext` | ASI07 | Agent traffic, tool arguments, and bearer tokens readable on the wire: insecure communication on the agent's own channel. |
+| `transport-downgrade` | ASI07 | A plaintext listener on the same host defeats the TLS the endpoint otherwise offers. |
 | `tls-cert-health` | ASI09 | Certificate and cipher problems undermine the assurance the transport is supposed to provide. |
 | `http-cors-wildcard` | ASI03 | Permissive CORS lets an arbitrary web origin act as the agent from a victim's browser. |
-| `http-rate-limit-absence` | ASI06 | No advertised limiting means a caller can drive the agent (and everything downstream of it) without backpressure. |
+| `http-rate-limit-absence` | ASI08 | No advertised limiting means a caller can drive the agent (and everything downstream of it) without backpressure: a cascading-failure concern. |
+| `mcp-tmpl-high-risk-tool-names` (template) | ASI02, ASI05 | Tool names suggesting shell execution or raw filesystem access are the unexpected-code-execution case; the inventory itself is the tool-misuse reconnaissance step. |
 
-## Two corrections
+## Three corrections
 
-**`mcp-host-header-validation` cited ASI05 (Memory & Context Poisoning).** DNS rebinding has nothing to do with an agent's memory or context. It is an identity and privilege problem: the attacker borrows the victim's network position to reach an endpoint that trusts it. Now ASI03.
+**The reference table followed an earlier draft of the numbering.** `ASITitles` in `internal/report/report.go` carried pre-v1.0 titles for ASI04 to ASI09 (Insecure Inter-Agent Communication, Memory & Context Poisoning, Cascading Failures, Excessive Agency, Supply Chain & Dependency Risk, Observability & Auditability Gaps), and every `asi_refs` was coded against it. The table now matches the published v1.0 list and is pinned by `TestASITitles_MatchPublishedV1`; the codes below were renumbered to keep the meaning each check was given: `http-rate-limit-absence` ASI06 to ASI08, `transport-plaintext` and `transport-downgrade` ASI04 to ASI07, the high-risk-tool-names template ASI07 to ASI05. The four checks still citing ASI09 (Human-Agent Trust Exploitation in v1.0) record observability and disclosure facts that the draft filed under a category the final list dropped; they are left as they are pending a decision on whether to uncite them like `mcp-auth-posture`.
 
-**`http-rate-limit-absence` cited ASI08 (Supply Chain & Dependency Risk).** Missing rate-limit headers say nothing about dependencies. Unbounded call volume against an agent is a cascading-failure and availability concern. Now ASI06.
+**`mcp-host-header-validation` cited ASI05 (Memory & Context Poisoning in the draft numbering; ASI06 in v1.0).** DNS rebinding has nothing to do with an agent's memory or context. It is an identity and privilege problem: the attacker borrows the victim's network position to reach an endpoint that trusts it. Now ASI03.
+
+**`http-rate-limit-absence` cited ASI08 (Supply Chain & Dependency Risk in the draft numbering; ASI04 in v1.0).** Missing rate-limit headers say nothing about dependencies. Unbounded call volume against an agent is a cascading-failure and availability concern, which is ASI08 in v1.0.
 
 ## Severity calibration
 

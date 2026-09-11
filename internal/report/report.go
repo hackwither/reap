@@ -544,15 +544,18 @@ func joinASITitled(refs []string) string {
 // Kept here so probes/templates can cite by code without hardcoding titles
 // everywhere, and so this list has exactly one place to update.
 var ASITitles = map[string]string{
+	// Published v1.0 numbering (December 2025). The previous table followed an
+	// earlier draft in which ASI04 to ASI09 carried different titles, and every
+	// probe's asi_refs was coded against that draft; see docs/ASI_MAPPING.md.
 	"ASI01": "Agent Goal Hijack",
-	"ASI02": "Tool Misuse & Exploitation",
-	"ASI03": "Agent Identity & Privilege Abuse",
-	"ASI04": "Insecure Inter-Agent Communication",
-	"ASI05": "Memory & Context Poisoning",
-	"ASI06": "Cascading Failures",
-	"ASI07": "Excessive Agency",
-	"ASI08": "Supply Chain & Dependency Risk",
-	"ASI09": "Observability & Auditability Gaps",
+	"ASI02": "Tool Misuse and Exploitation",
+	"ASI03": "Identity and Privilege Abuse",
+	"ASI04": "Agentic Supply Chain Vulnerabilities",
+	"ASI05": "Unexpected Code Execution (RCE)",
+	"ASI06": "Memory & Context Poisoning",
+	"ASI07": "Insecure Inter-Agent Communication",
+	"ASI08": "Cascading Failures",
+	"ASI09": "Human-Agent Trust Exploitation",
 	"ASI10": "Rogue Agents",
 }
 
