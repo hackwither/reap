@@ -41,6 +41,24 @@ archives:
       - templates/**/*
       - fingerprints/**/*
 
+homebrew_casks:
+  - name: reap
+    binaries:
+      - reap
+    repository:
+      owner: hackwither
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/hackwither/reap"
+    description: "Black-box reconnaissance for AI agent endpoints (MCP, A2A, OpenAPI)"
+    caveats: "Verify installation with: reap --version"
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/reap"]
+          end
+
 checksum:
   name_template: "checksums.txt"
 

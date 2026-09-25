@@ -8,13 +8,13 @@ Before scanning anything:
 
 - Get written authorization (a pentest SOW, a bug bounty program's published scope, or your own infrastructure).
 - Use `--authorized` only once you can truthfully make that claim.
-- Respect published bug bounty scope and rules of engagement exactly "MCP endpoint discovered via recon" is not automatically in scope just because it responds.
+- Respect published bug bounty scope and rules of engagement exactly. An MCP endpoint discovered via recon is not automatically in scope just because it responds.
 
 ## What the tool will not do
 
 By design, `reap`:
 
-- Never invokes a tool discovered on the target (no `tools/call`) enumeration only.
+- Never invokes a tool discovered on the target (no `tools/call`). Enumeration only.
 - Never attempts credential brute-forcing, injection payloads, or auth bypass beyond "does this listing method respond without an Authorization header."
 - Defaults to a single request per probe; it is not built as a load-testing or rate-limit-exhaustion tool.
 - Ships a plugin format (JSON templates) that is deliberately not Turing-complete — one request, a fixed set of matcher types specifically so a template can't smuggle in exploitation logic. See `docs/ARCHITECTURE.md`.

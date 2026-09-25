@@ -58,7 +58,7 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-This triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds cross-platform binaries, publishes a GitHub Release with checksums and a changelog, updates the `hackwither/homebrew-tap` cask, and pushes a multi-arch image to `ghcr.io/hackwither/reap`. See [`.goreleaser.yml`](.goreleaser.yml) for the exact build/publish steps. One-time setup (tap repo + `HOMEBREW_TAP_GITHUB_TOKEN` secret) only needs to happen once, before the first tag.
+This triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds cross-platform binaries, publishes a GitHub Release with checksums and a changelog, updates the `hackwither/homebrew-tap` cask, and pushes a multi-arch image to `ghcr.io/hackwither/reap`. See [`.goreleaser.yml`](.goreleaser.yml) for the exact build/publish steps. One-time setup (tap repo + `HOMEBREW_TAP_GITHUB_TOKEN` secret) only needs to happen once, before the next tag.
 
 ## Reporting exposures you find while testing this project
 
