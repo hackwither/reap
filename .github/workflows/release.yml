@@ -27,6 +27,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
 
   docker:
     needs: goreleaser
@@ -57,3 +58,7 @@ jobs:
           tags: |
             ghcr.io/hackwither/reap:${{ steps.ver.outputs.version }}
             ghcr.io/hackwither/reap:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/hackwither/reap
+            org.opencontainers.image.description=Black-box reconnaissance for AI agent endpoints
+            org.opencontainers.image.licenses=MIT

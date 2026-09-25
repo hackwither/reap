@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/github/go-mod/go-version/hackwither/reap" alt="Go version">
   <img src="https://img.shields.io/github/license/hackwither/reap" alt="License">
- <!-- <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release"> -->
+  <img src="https://img.shields.io/github/v/release/hackwither/reap" alt="Latest release">
 </p>
 
 **REAP is black-box reconnaissance for AI agent endpoints.** Point it at a URL or a bare `host:port` that you're authorized to test, and it identifies what agent protocol is running, enumerates the capability surface exposed to the caller, and reports the auth and transport posture around it, without ever invoking a single thing it discovers.
@@ -26,11 +26,20 @@ The MCP gateway your team shipped last sprint, to the agent endpoint a bug bount
 
 ## What makes it different
 
-**It reads, never invokes** This is enforced architecturally. A probe is only ever handed a `Session`, and `Session` exposes no method to call a tool or even to send a notification. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the boundary.
+**It reads, never invokes** This is enforced architecturally, not by review. A probe is only ever handed a `Session` — and that's the entire surface it gets:
 
-**It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS. REAP checks the things that only make sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to.
+```go
+type Session interface {
+	TargetURL() string
+	Do(ctx context.Context, method string, params any, opts ...ReqOption) (*RawResult, error)
+}
+```
 
-**Silence means something** Every probe records whether it ran, declined, errored, or was cut off, and the report carries a `status` of `complete` or `incomplete`. A target REAP couldn't reach never renders as a clean one.
+No `Call`. No `Invoke`. There is no method on `Session` that can dispatch a discovered tool — a probe that wants to do more than this has to go through a design discussion first, not a code review. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full boundary.
+
+**It's agent-native** Anyone can point nuclei at an endpoint and check TLS and CORS — that part's table stakes, and REAP does it too (see Transport posture below). What it adds on top is the stuff that only makes sense once you know you're talking to an agent: whether the full tool inventory answers to an anonymous caller, whether the handshake `instructions` field leaks operator prompt material, whether a dynamic-dispatch tool is hiding a capability surface much larger than `tools/list` admits to. Tools like [mcprobe](https://github.com/tamish560/mcprobe) inspect the MCP server you're about to install, by launching it and reading its metadata; REAP inspects the endpoint you've already exposed, from outside, with no credentials and no invocation. Different lane, zero check overlap.
+
+**Silence means something** Every probe records whether it ran, declined, errored, or was cut off, and the report carries a `status` of `complete` or `incomplete`. A target REAP couldn't reach never renders as a clean one — see [Coverage accounting](#coverage-accounting).
 
 **It's built for pipelines and CI** Text for humans, NDJSON for pipelines, SARIF 2.1.0 for GitHub Advanced Security. `--fail-on` gates a build on severity; findings, usage errors, and incomplete scans each get their own exit code. Single static Go binary, zero third-party dependencies, no API key, no telemetry, nothing leaves your machine except the requests you asked for.
 
@@ -38,15 +47,36 @@ The MCP gateway your team shipped last sprint, to the agent endpoint a bug bount
 
 ## Install
 
-Release binaries (Linux, macOS, Windows; amd64 and arm64) are attached to each [release](https://github.com/hackwither/reap/releases).
+Release binaries (Linux, macOS, Windows; amd64 and arm64) are attached to each [release](https://github.com/hackwither/reap/releases):
+
 ```sh
-go install github.com/hackwither/reap/cmd/reap@latest
+curl -sSL https://github.com/hackwither/reap/releases/download/v0.1.0/reap_0.1.0_linux_amd64.tar.gz | tar xz
+```
+
+(swap in the [latest release](https://github.com/hackwither/reap/releases) tag and your platform's `darwin`/`windows` + `amd64`/`arm64` combo.)
+
+macOS binaries are unsigned and unnotarized, so Gatekeeper quarantines them on first download. If `./reap` refuses to run, clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine ./reap
 ```
 
 Docker:
 
 ```sh
 docker run --rm ghcr.io/hackwither/reap -t https://your-host/mcp --authorized
+```
+
+Homebrew:
+
+```sh
+brew install hackwither/tap/reap
+```
+
+`go install`, if you'd rather build from the module cache than take a binary:
+
+```sh
+go install github.com/hackwither/reap/cmd/reap@latest
 ```
 
 From source:
@@ -122,7 +152,7 @@ reap -t https://maybe-an-mcp-host.example --protocol auto --authorized
 This is the fix for the single biggest trust-killer a recon tool can have: firing a stack of findings against a target that was never actually confirmed to speak the protocol being scanned (a plain web server returning `200`/HTML on every path looks a lot like a listener if nothing checks). Every finding carries a `confidence` ("high"/"medium"/"low"), and if the target never completes a real protocol handshake, `reap` says so loudly and caps every finding at `info`/low-confidence rather than reporting them at face value:
 
 ```
-⚠ TARGET NOT CONFIRMED AS AGENT ENDPOINT
+⚠ TARGET NOT CONFIRMED AS AN AGENT ENDPOINT
   mcp initialize handshake failed: decode initialize response: invalid character '<'
   looking for beginning of value. Findings below are LOW confidence and likely
   reflect a generic web server, not a real MCP handshake.
@@ -134,23 +164,56 @@ Discovered/assumed transport also picks which `Session` implementation actually 
 
 ## Output
 
-The identification block comes first. REAP is a recon tool, so what the endpoint *is* leads, and posture findings follow.
+The identification block comes first. REAP is a recon tool, so what the endpoint *is* leads, and posture findings follow. This is a real transcript, against the mock target from [Testing against a local range](#testing-against-a-local-range) below:
 
 ```
-reap report — http://10.0.0.7:8080/mcp
-  input:      10.0.0.7:8080 (resolved by discovery)
-  protocol:   mcp 2025-03-26
-  transport:  http-streamable
-  server:     internal-gateway 0.9.0
-  auth:       open (capability enumeration answered without credentials)
-  surface:    23 tools, 4 resources, 0 prompts
-  discovery:  mcp-http-streamable (confidence: high)
-  duration:   412ms
-  probes:     12 ran, 4 not-applicable
+ REAP  /  AI AGENT RECON
+ ────────────────────────────────────────────────────────────────────
+ v0.1.0
 
-  [HIGH]  MCP tool listing accessible without authentication (ASI02, ASI03)
-  ...
+ TARGET
+ http://127.0.0.1:8765/mcp
+ 127.0.0.1  •  MCP 2025-06-18  •  http-streamable  •  CONFIRMED
+ Agent       mock-insecure-gateway 0.9.0
+ Edge        BaseHTTP/0.6 Python/3.11.14
+ Discovery   mcp-http-streamable  •  high confidence
+ Auth        open  •  enumeration answered without credentials
+ Surface     3 tools  •  1 resources  •  0 prompts
+
+ FINDINGS  10 matched  •  use -v for full evidence
+
+ HIGH mcp-unauth-tools-list  HIGH CONFIDENCE
+ MCP tool listing accessible without authentication
+ tools/list returned 3 tool(s) to an unauthenticated caller: read_file, exec_shell, send_email
+ OWASP       ASI02: Tool Misuse & Exploitation, ASI03: Agent Identity & Privilege Abuse
+ Fix         Require authentication before tools/list, or scope the response so anonymous callers see nothing.
+
+ HIGH http-cors-wildcard
+ Permissive CORS policy on agent endpoint
+ Server returns Access-Control-Allow-Origin: * — any web origin can call this endpoint from a browser context.
+ OWASP       ASI03: Agent Identity & Privilege Abuse
+ Fix         Scope Access-Control-Allow-Origin to known first-party origins; never combine * with credentialed requests.
+ ...
+
+ POSTURE
+ HIGH RISK
+
+ 17 checks  •  10 matched  •  4 clean  •  3 skipped  •  8ms
+ 3 high · 2 med · 3 low · 2 info · 0 error
 ```
+
+`TARGET`'s state (`CONFIRMED`, `CONFIRMED (AUTH-GATED)`, or `UNCONFIRMED`) is about whether the endpoint is provably speaking the protocol — see [Discovery](#discovery-is-there-an-agent-here-at-all) above. `POSTURE` is a separate, unrelated verdict: the highest severity found (`CLEAN`, `INFORMATIONAL`, `LOW`/`MEDIUM`/`HIGH RISK`), or `SCAN ERROR` if nothing ran cleanly. Don't conflate the two — a confirmed target can still post a clean posture, and an unconfirmed one is capped at `INFORMATIONAL` regardless of what it looks like it returned.
+
+### Coverage accounting
+
+The line above `POSTURE` — `17 checks  •  10 matched  •  4 clean  •  3 skipped  •  8ms` — is the part worth reading closely, because it's the difference between "nothing wrong" and "we don't actually know."
+
+- **matched**: the check ran and found something; that's a finding above.
+- **clean**: the check ran, found nothing, and *was applicable* — this endpoint was actually tested for that condition and passed.
+- **skipped**: the check declined because it didn't apply here (wrong transport, capability absent) *or* was excluded via `--include`/`--exclude`. Either way, it says nothing about whether the target is safe.
+- **could not run** (only shown when nonzero): the check errored or was aborted — a transport failure, a decode error, a timeout. This is the one that matters most: it means the report is silent on that check not because the target passed, but because REAP couldn't finish asking the question. Each one is also listed individually below the coverage line, with its status and detail.
+
+When any check falls into that last bucket, the scan's `status` is `incomplete` and the report leads with `⚠ SCAN INCOMPLETE — ABSENT FINDINGS ARE NOT CLEAN RESULTS`. Every probe in REAP returns one of three things — a finding, `probe.NotApplicable("why")`, or a real error — and never silently swallows a failure as "nothing to report" (see [`CONTRIBUTING.md`](CONTRIBUTING.md)). That three-state contract is what makes the coverage line trustworthy: it can only report what it actually checked, because the type system won't let a probe claim "clean" for a check it never really ran.
 
 ### Exit codes
 
@@ -163,7 +226,7 @@ reap report — http://10.0.0.7:8080/mcp
 
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does, and [`docs/PROBES.md`](docs/PROBES.md) for the full probe reference. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
 
 ### Recon: what is this endpoint, and what will it tell a stranger?
 
