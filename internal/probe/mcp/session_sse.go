@@ -273,6 +273,8 @@ func (s *SSESession) Do(ctx context.Context, method string, params any, opts ...
 		req.Header.Set(k, v)
 	}
 
+	reqHeaders := probe.SnapshotHeaders(req.Header)
+
 	start := time.Now()
 	resp, err := s.httpClient.Do(req)
 	latency := time.Since(start)
@@ -280,7 +282,7 @@ func (s *SSESession) Do(ctx context.Context, method string, params any, opts ...
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
-		return &probe.RawResult{Latency: latency, Err: err}, err
+		return &probe.RawResult{Latency: latency, Err: err, ReqMethod: http.MethodPost, ReqURL: postURL, ReqHeaders: reqHeaders, ReqBody: body}, err
 	}
 	defer resp.Body.Close()
 	postBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
@@ -295,12 +297,13 @@ func (s *SSESession) Do(ctx context.Context, method string, params any, opts ...
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
-		return &probe.RawResult{StatusCode: resp.StatusCode, Headers: resp.Header, Body: postBody, Latency: latency}, nil
+		return &probe.RawResult{StatusCode: resp.StatusCode, Headers: resp.Header, Body: postBody, Latency: latency, ReqMethod: http.MethodPost, ReqURL: postURL, ReqHeaders: reqHeaders, ReqBody: body}, nil
 	}
 
 	select {
 	case raw := <-respCh:
 		raw.Latency = latency
+		raw.ReqMethod, raw.ReqURL, raw.ReqHeaders, raw.ReqBody = http.MethodPost, postURL, reqHeaders, body
 		return raw, nil
 	case <-ctx.Done():
 		s.mu.Lock()

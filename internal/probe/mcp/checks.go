@@ -41,18 +41,6 @@ func BuiltinProbes() []probe.Probe {
 	}
 }
 
-// reproBody renders the exact JSON-RPC request body a probe sent, for the
-// HTTPExchange repro line — matches the envelope mcp.Session.Do builds (see
-// session.go's rpcRequest), with a fixed id since reproduction doesn't
-// depend on which request number this was in the session.
-func reproBody(method string, params any) string {
-	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-	if err != nil {
-		return ""
-	}
-	return string(body)
-}
-
 // httpOnlyTransports is returned by probes whose check is inherently about
 // HTTP mechanics (headers, TLS, CORS, well-known metadata endpoints) and
 // therefore can't run meaningfully over a non-HTTP transport like stdio or
@@ -145,6 +133,9 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 		return nil
 	}
 
+	reqExch := raw.Exchange()
+	reqExch.Expected = "request rejected (4xx) for a Host header that doesn't match the configured endpoint"
+
 	r.AddFinding(report.Finding{
 		ID:          p.ID(),
 		Title:       "MCP accepted initialize with a mismatched Host header",
@@ -159,16 +150,7 @@ func (p *hostHeaderValidationProbe) Run(ctx context.Context, s probe.Session, r 
 			"server_name":        envelope.Result.ServerInfo.Name,
 			"server_version":     envelope.Result.ServerInfo.Version,
 		},
-		Request: &report.HTTPExchange{
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Headers:     map[string]string{"Host": foreignHost, "Content-Type": "application/json"},
-			Body:        reproBody("initialize", params),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-			Expected:    "request rejected (4xx) for a Host header that doesn't match the configured endpoint",
-		},
+		Request:     reqExch,
 		Remediation: "Validate the Host header or equivalent request target before accepting MCP requests, and refuse requests whose host name does not match the configured endpoint.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"transport", "host-header"},
@@ -217,6 +199,8 @@ func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r 
 	if sawChallenge {
 		wwwAuth := unauthRaw.Headers.Get("WWW-Authenticate")
 		if !strings.Contains(strings.ToLower(wwwAuth), "bearer") {
+			reqExch := unauthRaw.Exchange()
+			reqExch.Expected = `WWW-Authenticate header containing "Bearer"`
 			r.AddFinding(report.Finding{
 				ID:          "mcp-oauth-bearer-challenge-missing",
 				Title:       "Protected resource does not send a Bearer WWW-Authenticate challenge",
@@ -227,15 +211,7 @@ func (p *oauthMetadataPostureProbe) Run(ctx context.Context, s probe.Session, r 
 				References:  []string{"RFC 9728 (Protected Resource Metadata)", "RFC 6750 (Bearer Token Usage)"},
 				Description: fmt.Sprintf("An unauthenticated tools/list request returned %d, but its WWW-Authenticate header did not include a Bearer challenge (got %q).", unauthRaw.StatusCode, wwwAuth),
 				Evidence:    map[string]any{"www_authenticate": wwwAuth},
-				Request: &report.HTTPExchange{
-					Method:      "POST",
-					URL:         s.TargetURL(),
-					Body:        reproBody("tools/list", map[string]any{}),
-					StatusCode:  unauthRaw.StatusCode,
-					ContentType: unauthRaw.Headers.Get("Content-Type"),
-					BodySize:    len(unauthRaw.Body),
-					Expected:    `WWW-Authenticate header containing "Bearer"`,
-				},
+				Request:     reqExch,
 				Remediation: "Send a WWW-Authenticate: Bearer challenge (optionally with a resource_metadata parameter per RFC 9728) on unauthenticated requests to protected MCP endpoints.",
 				Source:      "builtin:mcp",
 				Tags:        []string{"oauth", "authn"},
@@ -693,6 +669,9 @@ func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *repo
 		sev = report.SeverityHigh
 	}
 
+	reqExch := raw.Exchange()
+	reqExch.Expected = "401/403 for an anonymous (no Authorization header) tools/list call"
+
 	r.AddFinding(report.Finding{
 		ID:          p.ID(),
 		Title:       "MCP tool listing accessible without authentication",
@@ -702,15 +681,7 @@ func (p *unauthToolsListProbe) Run(ctx context.Context, s probe.Session, r *repo
 		ASI:         []string{"ASI02", "ASI03"},
 		Description: fmt.Sprintf("tools/list returned %d tool(s) to an unauthenticated caller: %s", len(names), strings.Join(names, ", ")),
 		Evidence:    map[string]any{"tool_count": len(names), "tool_names": names},
-		Request: &report.HTTPExchange{
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Body:        reproBody("tools/list", map[string]any{}),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-			Expected:    "401/403 for an anonymous (no Authorization header) tools/list call",
-		},
+		Request:     reqExch,
 		Remediation: "Require authentication before tools/list, or scope the response so anonymous callers see nothing.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"auth", "enumeration"},
@@ -809,16 +780,9 @@ func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r
 			ASI:         []string{"ASI09"},
 			Description: fmt.Sprintf("tools/list returned %d without credentials — the server correctly gates enumeration behind authentication, so no tool inventory is available from this vantage point.", raw.StatusCode),
 			Evidence:    map[string]any{"status_code": raw.StatusCode},
-			Request: &report.HTTPExchange{
-				Method:      "POST",
-				URL:         s.TargetURL(),
-				Body:        reproBody("tools/list", map[string]any{}),
-				StatusCode:  raw.StatusCode,
-				ContentType: raw.Headers.Get("Content-Type"),
-				BodySize:    len(raw.Body),
-			},
-			Source: "builtin:mcp",
-			Tags:   []string{"inventory", "auth"},
+			Request:     tools.FirstRaw.Exchange(),
+			Source:      "builtin:mcp",
+			Tags:        []string{"inventory", "auth"},
 		})
 		return nil
 	}
@@ -862,16 +826,9 @@ func (p *toolCapabilitySurfaceProbe) Run(ctx context.Context, s probe.Session, r
 		ASI:         []string{"ASI09"},
 		Description: "Full tool surface exposed by this endpoint, for asset-inventory and diffing purposes.",
 		Evidence:    map[string]any{"tools": tools.Items, "dangerous_tools": dangerousTools(tools.Items), "pages": tools.Pages, "truncated": tools.Truncated},
-		Request: &report.HTTPExchange{
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Body:        reproBody("tools/list", map[string]any{}),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-		},
-		Source: "builtin:mcp",
-		Tags:   []string{"inventory"},
+		Request:     tools.FirstRaw.Exchange(),
+		Source:      "builtin:mcp",
+		Tags:        []string{"inventory"},
 	})
 	return nil
 }
@@ -918,14 +875,7 @@ func (p *instructionsExposureProbe) Run(ctx context.Context, s probe.Session, r 
 		ASI:         []string{"ASI09"},
 		Description: "The initialize response's 'instructions' field is long and/or contains language patterns (secrecy directives, 'internal', credential-related terms) worth a human review to confirm it isn't leaking operational or internal detail to any caller.",
 		Evidence:    map[string]any{"instructions_length": len(init.Instructions), "instructions_excerpt": excerpt(init.Instructions, 200)},
-		Request: &report.HTTPExchange{
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Body:        reproBody("initialize", initializeParams(negotiatedOr(s, SupportedProtocolVersions[0]))),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-		},
+		Request:     raw.Exchange(),
 		Remediation: "Keep client-facing instructions limited to usage guidance; keep anything sensitive out of fields returned pre-authentication.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"information-disclosure"},
@@ -981,6 +931,8 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 		if count == 0 {
 			continue
 		}
+		reqExch := raw.Exchange()
+		reqExch.Expected = "401/403 for an anonymous " + method + " call"
 		r.AddFinding(report.Finding{
 			ID:          p.ID() + "-" + strings.ReplaceAll(method, "/", "-"),
 			Title:       fmt.Sprintf("Unauthenticated %s returns %d item(s)", method, count),
@@ -990,15 +942,7 @@ func (p *resourcesPromptsExposureProbe) Run(ctx context.Context, s probe.Session
 			ASI:         []string{"ASI02"},
 			Description: fmt.Sprintf("%s succeeded without credentials and returned %d item(s) to an anonymous caller.", method, count),
 			Evidence:    map[string]any{"method": method, "item_count": count},
-			Request: &report.HTTPExchange{
-				Method:      "POST",
-				URL:         s.TargetURL(),
-				Body:        reproBody(method, map[string]any{}),
-				StatusCode:  raw.StatusCode,
-				ContentType: raw.Headers.Get("Content-Type"),
-				BodySize:    len(raw.Body),
-				Expected:    "401/403 for an anonymous " + method + " call",
-			},
+			Request:     reqExch,
 			Remediation: "Gate resource/prompt listings behind authentication if their contents aren't meant to be public.",
 			Source:      "builtin:mcp",
 			Tags:        []string{"auth", "enumeration"},
@@ -1114,14 +1058,7 @@ func (p *dynamicDispatchProbe) Run(ctx context.Context, s probe.Session, r *repo
 			"search_tools":   searchTools,
 			"dispatch_tools": dispatcherTools,
 		},
-		Request: &report.HTTPExchange{
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Body:        reproBody("tools/list", map[string]any{}),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-		},
+		Request:     raw.Exchange(),
 		Remediation: "Expose a complete dispatchable tool manifest or provide a discoverable read-only tool inventory (for example, an extended list endpoint) so downstream security tooling can account for the full surface.",
 		Source:      "builtin:mcp",
 		Tags:        []string{"inventory", "capability-surface"},

@@ -183,11 +183,6 @@ func (p *templateProbe) Run(ctx context.Context, s probe.Session, r *report.Repo
 		return nil
 	}
 
-	headers := make(map[string]string, len(t.Request.Headers))
-	for k, v := range t.Request.Headers {
-		headers[k] = v
-	}
-
 	confidence := t.Info.Confidence
 	if confidence == "" {
 		confidence = "high" // a JSON template only fires when its matchers actually matched — same default standard as a hand-written probe
@@ -203,36 +198,12 @@ func (p *templateProbe) Run(ctx context.Context, s probe.Session, r *report.Repo
 		References:  t.Info.References,
 		Description: t.Info.Description,
 		Evidence:    map[string]any{"matchers": matchEvidence, "status_code": raw.StatusCode, "rpc_method": t.Request.Method},
-		Request: &report.HTTPExchange{
-			// Templates dispatch through probe.Session.Do, which always
-			// speaks JSON-RPC over an HTTP POST regardless of the
-			// underlying rpc_method — see mcp.Session.Do.
-			Method:      "POST",
-			URL:         s.TargetURL(),
-			Headers:     headers,
-			Body:        jsonRPCBody(t.Request.Method, t.Request.Params),
-			StatusCode:  raw.StatusCode,
-			ContentType: raw.Headers.Get("Content-Type"),
-			BodySize:    len(raw.Body),
-		},
+		Request:     raw.Exchange(),
 		Remediation: t.Info.Remediation,
 		Source:      "template:" + t.ID,
 		Tags:        t.Info.Tags,
 	})
 	return nil
-}
-
-// jsonRPCBody renders the exact JSON-RPC envelope a template's request
-// turns into on the wire, for the HTTPExchange repro line — matches the
-// shape probe.Session.Do's callers build (see mcp.Session.Do's rpcRequest),
-// with a fixed id since reproduction doesn't depend on which request number
-// this was in the session.
-func jsonRPCBody(method string, params any) string {
-	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-	if err != nil {
-		return ""
-	}
-	return string(body)
 }
 
 // EvalMatcher evaluates a single Matcher against a raw response, exported so

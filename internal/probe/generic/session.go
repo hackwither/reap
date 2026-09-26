@@ -63,8 +63,10 @@ func (s *Session) Do(ctx context.Context, method string, params any, opts ...pro
 	}
 
 	var body io.Reader
+	var encoded []byte
 	if params != nil {
-		encoded, err := json.Marshal(params)
+		var err error
+		encoded, err = json.Marshal(params)
 		if err != nil {
 			return nil, fmt.Errorf("encode request body: %w", err)
 		}
@@ -93,22 +95,28 @@ func (s *Session) Do(ctx context.Context, method string, params any, opts ...pro
 		req.Header.Set(k, v)
 	}
 
+	reqHeaders := probe.SnapshotHeaders(req.Header)
+
 	start := time.Now()
 	resp, err := s.client.HTTP().Do(req)
 	latency := time.Since(start)
 	if err != nil {
-		return &probe.RawResult{Latency: latency, Err: err}, err
+		return &probe.RawResult{Latency: latency, Err: err, ReqMethod: verb, ReqURL: s.url, ReqHeaders: reqHeaders, ReqBody: encoded}, err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return &probe.RawResult{StatusCode: resp.StatusCode, Latency: latency, Err: err}, err
+		return &probe.RawResult{StatusCode: resp.StatusCode, Latency: latency, Err: err, ReqMethod: verb, ReqURL: s.url, ReqHeaders: reqHeaders, ReqBody: encoded}, err
 	}
 	return &probe.RawResult{
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header,
 		Body:       respBody,
 		Latency:    latency,
+		ReqMethod:  verb,
+		ReqURL:     s.url,
+		ReqHeaders: reqHeaders,
+		ReqBody:    encoded,
 	}, nil
 }

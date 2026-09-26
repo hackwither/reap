@@ -28,6 +28,9 @@ type listResult struct {
 	// care about transport-level observations rather than the payload.
 	FirstStatus  int
 	FirstHeaders http.Header
+	// FirstRaw is the first page's full RawResult, for probes that need a
+	// reproducible Request exchange rather than just the status/headers.
+	FirstRaw *probe.RawResult
 	// RPCError is set when the server answered with a JSON-RPC error, which
 	// is a substantive answer rather than a failure.
 	RPCError *rpcError
@@ -77,6 +80,7 @@ func listAll(ctx context.Context, s probe.Session, method, itemsField string, op
 		if page == 0 {
 			out.FirstStatus = raw.StatusCode
 			out.FirstHeaders = raw.Headers
+			out.FirstRaw = raw
 		}
 
 		var envelope struct {

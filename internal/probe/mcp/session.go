@@ -204,17 +204,31 @@ func (s *Session) do(ctx context.Context, method string, params any, o *probe.Re
 		req.Header.Set(k, v)
 	}
 
+	reqHeaders := probe.SnapshotHeaders(req.Header)
+	var setup *probe.RawResult
+	if sessionID != "" && method != "initialize" {
+		// This request's Mcp-Session-Id is an ephemeral token from a prior
+		// handshake on this Session — a standalone repro that replays the
+		// literal captured value may already be stale by the time someone
+		// runs it. MCP-Protocol-Version, by contrast, is a stable spec
+		// revision string with nothing to expire, so it doesn't need this
+		// treatment on its own. See HTTPExchange.Setup.
+		s.mu.Lock()
+		setup = s.initRaw
+		s.mu.Unlock()
+	}
+
 	start := time.Now()
 	resp, err := s.client.HTTP().Do(req)
 	latency := time.Since(start)
 	if err != nil {
-		return &probe.RawResult{Latency: latency, Err: err}, err
+		return &probe.RawResult{Latency: latency, Err: err, ReqMethod: http.MethodPost, ReqURL: s.url, ReqHeaders: reqHeaders, ReqBody: body, Setup: setup}, err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return &probe.RawResult{StatusCode: resp.StatusCode, Latency: latency, Err: err}, err
+		return &probe.RawResult{StatusCode: resp.StatusCode, Latency: latency, Err: err, ReqMethod: http.MethodPost, ReqURL: s.url, ReqHeaders: reqHeaders, ReqBody: body, Setup: setup}, err
 	}
 
 	// Streamable-HTTP MCP servers may legally answer a single request with
@@ -235,6 +249,11 @@ func (s *Session) do(ctx context.Context, method string, params any, o *probe.Re
 		Headers:    resp.Header,
 		Body:       respBody,
 		Latency:    latency,
+		ReqMethod:  http.MethodPost,
+		ReqURL:     s.url,
+		ReqHeaders: reqHeaders,
+		ReqBody:    body,
+		Setup:      setup,
 	}, nil
 }
 

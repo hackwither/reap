@@ -65,6 +65,65 @@ type RawResult struct {
 	Body       []byte
 	Latency    time.Duration
 	Err        error
+
+	// ReqMethod, ReqURL, ReqHeaders, and ReqBody echo the actual outgoing
+	// request that produced this result. Each Session implementation
+	// captures these at the one place it already builds the real request,
+	// so they can never drift from what was actually sent the way a
+	// probe's own hand-reconstructed evidence could.
+	ReqMethod  string
+	ReqURL     string
+	ReqHeaders map[string]string
+	ReqBody    []byte
+
+	// Setup is the initialize handshake's own RawResult, when this result
+	// depended on session state (Mcp-Session-Id, negotiated protocol
+	// version) obtained from a prior handshake on the same Session. Nil for
+	// a standalone request, including the handshake itself.
+	Setup *RawResult
+}
+
+// SnapshotHeaders copies an http.Header into a flat map suitable for finding
+// evidence — the exact headers actually sent, captured by a Session
+// implementation right after it sets them on the real request, rather than
+// reconstructed from probe-side assumptions. Multi-value headers collapse to
+// their first value; no Session implementation here sets any header twice.
+func SnapshotHeaders(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		if len(v) > 0 {
+			out[k] = v[0]
+		}
+	}
+	return out
+}
+
+// Exchange converts this result into a report.HTTPExchange for finding
+// evidence, recursively including Setup so a session-dependent finding's
+// evidence carries the handshake that established its session alongside
+// the call that actually produced the finding. Returns nil if the request
+// side was never captured (e.g. a WebSocket transport, which has no
+// per-message HTTP request to curl-replay).
+func (r *RawResult) Exchange() *report.HTTPExchange {
+	if r == nil || r.ReqMethod == "" {
+		return nil
+	}
+	e := &report.HTTPExchange{
+		Method:     r.ReqMethod,
+		URL:        r.ReqURL,
+		Headers:    r.ReqHeaders,
+		Body:       string(r.ReqBody),
+		StatusCode: r.StatusCode,
+		BodySize:   len(r.Body),
+		Setup:      r.Setup.Exchange(),
+	}
+	if r.Headers != nil {
+		e.ContentType = r.Headers.Get("Content-Type")
+	}
+	return e
 }
 
 // ReqOption customizes one request (e.g. WithNoAuth to test the

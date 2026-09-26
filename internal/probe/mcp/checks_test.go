@@ -692,4 +692,25 @@ func TestUnauthToolsListProbeStillDetectsAnonymousStreamable(t *testing.T) {
 	if rep.Findings[0].ID != "mcp-unauth-tools-list" {
 		t.Fatalf("expected mcp-unauth-tools-list, got %q", rep.Findings[0].ID)
 	}
+
+	// Regression test for the non-reproducible curl bug: a finding whose
+	// tools/list call depended on a prior initialize handshake must carry
+	// that handshake as Request.Setup, and the actual headers sent (not a
+	// hand-reconstructed guess) on the exchange itself.
+	req := rep.Findings[0].Request
+	if req == nil {
+		t.Fatal("expected finding to carry a Request exchange")
+	}
+	if req.Headers["Content-Type"] != "application/json" {
+		t.Fatalf("expected the real Content-Type header to be captured, got %q", req.Headers["Content-Type"])
+	}
+	if req.Headers["Mcp-Session-Id"] != sessionID {
+		t.Fatalf("expected the real session id header to be captured, got %q", req.Headers["Mcp-Session-Id"])
+	}
+	if req.Setup == nil {
+		t.Fatal("expected Request.Setup to carry the initialize handshake this tools/list call depended on")
+	}
+	if !strings.Contains(req.Setup.Body, `"initialize"`) {
+		t.Fatalf("expected Request.Setup.Body to be the initialize call, got %q", req.Setup.Body)
+	}
 }

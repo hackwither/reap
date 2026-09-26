@@ -219,7 +219,13 @@ func (h humanRenderer) finding(f Finding) {
 			h.fact("Expected", f.Request.Expected)
 		}
 		if h.verbose {
-			h.fact("Reproduce", f.Request.Curl())
+			if script := f.Request.ReproScript(); script != "" {
+				lines := strings.Split(script, "\n")
+				h.fact("Reproduce", lines[0])
+				for _, ln := range lines[1:] {
+					h.fact("", ln)
+				}
+			}
 		}
 	}
 	if h.verbose && len(f.Evidence) > 0 {

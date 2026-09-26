@@ -395,3 +395,60 @@ func asiID(n int) string {
 	}
 	return "ASI10"
 }
+
+// TestReproScript_NoSetup is a regression test for ReproScript falling back
+// to plain Curl when an exchange didn't depend on a prior handshake.
+func TestReproScript_NoSetup(t *testing.T) {
+	e := &HTTPExchange{Method: "POST", URL: "https://agent.example/mcp", Body: `{"method":"tools/list"}`}
+	if got, want := e.ReproScript(), e.Curl(); got != want {
+		t.Fatalf("ReproScript with no Setup = %q, want it to equal Curl() = %q", got, want)
+	}
+	if !strings.HasPrefix(e.ReproScript(), "curl -s -X POST") {
+		t.Fatalf("ReproScript with no Setup = %q, want a single curl line", e.ReproScript())
+	}
+}
+
+// TestReproScript_WithSetup is the regression test for the bug this feature
+// fixes: a finding whose evidence depended on a prior initialize handshake
+// used to render a curl one-liner that skipped the handshake and the
+// session ID entirely, which a real MCP server would reject or answer
+// differently. ReproScript must instead render a two-step script that
+// re-runs the handshake and captures a fresh session ID rather than
+// replaying the (possibly already expired) literal value reap observed.
+func TestReproScript_WithSetup(t *testing.T) {
+	setup := &HTTPExchange{
+		Method: "POST",
+		URL:    "https://agent.example/mcp",
+		Body:   `{"method":"initialize"}`,
+	}
+	e := &HTTPExchange{
+		Method:  "POST",
+		URL:     "https://agent.example/mcp",
+		Headers: map[string]string{"Mcp-Session-Id": "abc123-do-not-replay-this-literal-value"},
+		Body:    `{"method":"tools/list"}`,
+		Setup:   setup,
+	}
+	script := e.ReproScript()
+	lines := strings.Split(script, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("ReproScript with Setup produced %d line(s), want 2:\n%s", len(lines), script)
+	}
+	if !strings.HasPrefix(lines[0], "SID=$(curl") {
+		t.Fatalf("first line = %q, want it to capture SID from the setup exchange", lines[0])
+	}
+	if !strings.Contains(lines[0], `"method":"initialize"`) {
+		t.Fatalf("first line = %q, want it to replay the setup (initialize) exchange, not the outer one", lines[0])
+	}
+	if !strings.Contains(lines[0], "grep -i '^Mcp-Session-Id:'") {
+		t.Fatalf("first line = %q, want it to extract Mcp-Session-Id from the setup response headers", lines[0])
+	}
+	if strings.Contains(script, "abc123-do-not-replay-this-literal-value") {
+		t.Fatalf("ReproScript replayed the literal (possibly stale) session ID instead of capturing a fresh one:\n%s", script)
+	}
+	if !strings.Contains(lines[1], `"$SID"`) {
+		t.Fatalf("second line = %q, want the Mcp-Session-Id header to use the freshly-captured $SID", lines[1])
+	}
+	if !strings.Contains(lines[1], `"method":"tools/list"`) {
+		t.Fatalf("second line = %q, want it to replay the actual (tools/list) exchange", lines[1])
+	}
+}
