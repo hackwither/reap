@@ -47,13 +47,18 @@ No `Call`. No `Invoke`. There is no method on `Session` that can dispatch a disc
 
 ## Install
 
-Release binaries (Linux, macOS, Windows; amd64 and arm64) are attached to each [release](https://github.com/hackwither/reap/releases):
+Release binaries are attached to each [release](https://github.com/hackwither/reap/releases): Linux and macOS for amd64/arm64, Windows for amd64 only.
 
 ```sh
+# linux/amd64 — swap the tag for the latest release, and linux_arm64 /
+# darwin_amd64 / darwin_arm64 for another platform (same tar.gz format)
 curl -sSL https://github.com/hackwither/reap/releases/download/v0.1.0/reap_0.1.0_linux_amd64.tar.gz | tar xz
 ```
 
-(swap in the [latest release](https://github.com/hackwither/reap/releases) tag and your platform's `darwin`/`windows` + `amd64`/`arm64` combo.)
+```sh
+# windows/amd64 — this one ships as a .zip, not a .tar.gz
+curl -sSLo reap.zip https://github.com/hackwither/reap/releases/download/v0.1.0/reap_0.1.0_windows_amd64.zip && unzip reap.zip
+```
 
 macOS binaries are unsigned and unnotarized, so Gatekeeper quarantines them on first download. If `./reap` refuses to run, clear the quarantine flag:
 
@@ -226,7 +231,7 @@ When any check falls into that last bucket, the scan's `status` is `incomplete` 
 
 ## What it checks
 
-Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does, and [`docs/PROBES.md`](docs/PROBES.md) for the full probe reference. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` one-liner so you can verify it by hand rather than take the tool's word for it.
+Findings map to OWASP Agentic Security Initiative categories (ASI01-ASI10), see [`docs/ASI_MAPPING.md`](docs/ASI_MAPPING.md) for why each check cites what it does, and [`docs/PROBES.md`](docs/PROBES.md) for the full probe reference. Each finding carries a stable rule ID, a confidence level, and, where a single request/response produced it, a reproducible `curl` command so you can verify it by hand rather than take the tool's word for it — a one-liner for a standalone request, or a short two-step script (re-run the handshake, capture a fresh session ID, then replay the call) for a finding whose session depended on one.
 
 ### Recon: what is this endpoint, and what will it tell a stranger?
 

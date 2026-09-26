@@ -84,26 +84,71 @@ type HTTPExchange struct {
 	ContentType string            `json:"content_type,omitempty"`
 	BodySize    int               `json:"body_size,omitempty"`
 	Expected    string            `json:"expected,omitempty"` // what a real match would have looked like, e.g. "text/event-stream or application/json"
+
+	// Setup is the exchange that had to happen first to make this one
+	// reproducible — e.g. the initialize handshake that obtained the
+	// Mcp-Session-Id this exchange depends on. Nil for a standalone
+	// request. See ReproScript.
+	Setup *HTTPExchange `json:"setup,omitempty"`
 }
 
-// Curl renders the request half of the exchange as a copy-pasteable
-// reproduction command.
-func (e *HTTPExchange) Curl() string {
-	if e == nil {
-		return ""
-	}
+// sessionIDHeader is the header ReproScript treats as session-dependent: its
+// value is replaced with a freshly-captured $SID rather than the literal
+// value observed at scan time, which may already be expired by the time
+// someone runs the script.
+const sessionIDHeader = "Mcp-Session-Id"
+
+// curlArgs renders the request half of the exchange as curl flag tokens
+// (everything after "curl -s"), shared by Curl and ReproScript so both stay
+// in sync. When live is true, the session-ID header's value is rendered as
+// the shell-interpolated "$SID" instead of its literal captured value.
+func (e *HTTPExchange) curlArgs(live bool) string {
 	var b strings.Builder
-	b.WriteString("curl -s")
 	if e.Method != "" && !strings.EqualFold(e.Method, "GET") {
 		fmt.Fprintf(&b, " -X %s", e.Method)
 	}
 	for k, v := range e.Headers {
+		if live && strings.EqualFold(k, sessionIDHeader) {
+			fmt.Fprintf(&b, " -H %s", shellQuote(k+": ")+`"$SID"`)
+			continue
+		}
 		fmt.Fprintf(&b, " -H %s", shellQuote(k+": "+v))
 	}
 	if e.Body != "" {
 		fmt.Fprintf(&b, " -d %s", shellQuote(e.Body))
 	}
 	fmt.Fprintf(&b, " %s", shellQuote(e.URL))
+	return b.String()
+}
+
+// Curl renders the request half of the exchange as a copy-pasteable
+// reproduction command. It never looks at Setup — a exchange that depended
+// on a prior handshake isn't reproducible as a single line; see ReproScript.
+func (e *HTTPExchange) Curl() string {
+	if e == nil {
+		return ""
+	}
+	return "curl -s" + e.curlArgs(false)
+}
+
+// ReproScript renders a copy-pasteable reproduction. For a standalone
+// exchange this is identical to Curl. For an exchange that depended on a
+// prior handshake (Setup != nil), it renders a two-step script: first it
+// replays the setup exchange and captures the session ID the server issued
+// from the response headers, then it replays the actual exchange using that
+// freshly-captured session ID rather than the one REAP originally observed,
+// which may already be expired.
+func (e *HTTPExchange) ReproScript() string {
+	if e == nil {
+		return ""
+	}
+	if e.Setup == nil {
+		return e.Curl()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "SID=$(curl -s -D- -o /dev/null%s | grep -i '^%s:' | cut -d: -f2 | tr -d ' \\r')\n",
+		e.Setup.curlArgs(false), sessionIDHeader)
+	fmt.Fprintf(&b, "curl -s%s", e.curlArgs(true))
 	return b.String()
 }
 
@@ -607,7 +652,7 @@ func WriteSARIFRuns(reports []*Report, w io.Writer) error {
 			if f.Confidence != "" {
 				props["confidence"] = f.Confidence
 			}
-			if repro := f.Request.Curl(); repro != "" {
+			if repro := f.Request.ReproScript(); repro != "" {
 				props["reproduce"] = repro
 			}
 			results = append(results, map[string]any{

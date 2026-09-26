@@ -26,7 +26,6 @@ import (
 
 	"github.com/hackwither/reap/internal/httpx"
 	"github.com/hackwither/reap/internal/probe"
-	"github.com/hackwither/reap/internal/report"
 	"github.com/hackwither/reap/internal/template"
 	"github.com/hackwither/reap/internal/version"
 )
@@ -124,7 +123,7 @@ func (d *fingerprintDetector) Detect(ctx context.Context, c Candidate, opts Dete
 	var authGated *Fingerprint
 
 	for _, url := range t.candidateURLs(c) {
-		raw, sentMethod, sentBody, err := doFingerprintRequest(ctx, url, t.Request, opts)
+		raw, err := doFingerprintRequest(ctx, url, t.Request, opts)
 		if err != nil {
 			continue // unreachable candidate URL is not a Detector failure
 		}
@@ -150,6 +149,8 @@ func (d *fingerprintDetector) Detect(ctx context.Context, c Candidate, opts Dete
 			if authGated == nil && t.Request.RPCMethod != "" && (raw.StatusCode == http.StatusUnauthorized || raw.StatusCode == http.StatusForbidden) {
 				matchedCandidate := c
 				matchedCandidate.URL = url
+				reqExch := raw.Exchange()
+				reqExch.Expected = "a completed JSON-RPC initialize result (requires valid credentials to confirm)"
 				authGated = &Fingerprint{
 					Candidate:  matchedCandidate,
 					Protocol:   t.Protocol,
@@ -161,16 +162,7 @@ func (d *fingerprintDetector) Detect(ctx context.Context, c Candidate, opts Dete
 						"note":        "responded with an auth-required status at a plausible endpoint path, but the handshake could not be confirmed without credentials",
 					},
 					DetectorID: t.ID + "-auth-gated",
-					Request: &report.HTTPExchange{
-						Method:      sentMethod,
-						URL:         url,
-						Headers:     t.Request.Headers,
-						Body:        sentBody,
-						StatusCode:  raw.StatusCode,
-						ContentType: raw.Headers.Get("Content-Type"),
-						BodySize:    len(raw.Body),
-						Expected:    "a completed JSON-RPC initialize result (requires valid credentials to confirm)",
-					},
+					Request:    reqExch,
 				}
 			}
 			continue
@@ -188,15 +180,7 @@ func (d *fingerprintDetector) Detect(ctx context.Context, c Candidate, opts Dete
 			Confidence: t.OnMatch,
 			Evidence:   map[string]any{"matchers": evidence, "status_code": raw.StatusCode, "url": url},
 			DetectorID: t.ID,
-			Request: &report.HTTPExchange{
-				Method:      sentMethod,
-				URL:         url,
-				Headers:     t.Request.Headers,
-				Body:        sentBody,
-				StatusCode:  raw.StatusCode,
-				ContentType: raw.Headers.Get("Content-Type"),
-				BodySize:    len(raw.Body),
-			},
+			Request:    raw.Exchange(),
 		}
 		applyExtract(fp, t.Extract, decoded)
 		return fp, nil
@@ -275,17 +259,19 @@ func (t *FingerprintTemplate) candidateURLs(c Candidate) []string {
 }
 
 // doFingerprintRequest sends the single request a fingerprint describes and
-// returns the raw response plus the HTTP method and body actually sent —
-// the latter two exist purely so the caller can build an accurate
-// reproduction command; they play no role in matching.
-func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts DetectOptions) (*probe.RawResult, string, string, error) {
+// returns the raw response, with RawResult's request-echo fields populated
+// from what was actually put on the wire (including the Content-Type this
+// function auto-injects for an RPC request, and any Authorization header),
+// so callers get an accurate reproduction for free via RawResult.Exchange
+// instead of reconstructing it from the pre-injection template headers.
+func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts DetectOptions) (*probe.RawResult, error) {
 	method := req.HTTPMethod
 	if method == "" {
 		method = http.MethodGet
 	}
 
 	var bodyReader io.Reader
-	var sentBody string
+	var sentBody []byte
 	headers := make(map[string]string, len(req.Headers)+1)
 	for k, v := range req.Headers {
 		headers[k] = v
@@ -299,9 +285,9 @@ func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts D
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
-			return nil, "", "", fmt.Errorf("encode fingerprint request: %w", err)
+			return nil, fmt.Errorf("encode fingerprint request: %w", err)
 		}
-		sentBody = string(body)
+		sentBody = body
 		bodyReader = bytes.NewReader(body)
 		if _, ok := headers["Content-Type"]; !ok {
 			headers["Content-Type"] = "application/json"
@@ -310,7 +296,7 @@ func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts D
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("build fingerprint request: %w", err)
+		return nil, fmt.Errorf("build fingerprint request: %w", err)
 	}
 	for k, v := range headers {
 		httpReq.Header.Set(k, v)
@@ -318,23 +304,24 @@ func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts D
 	if opts.AuthHeader != "" {
 		httpReq.Header.Set("Authorization", opts.AuthHeader)
 	}
+	reqHeaders := probe.SnapshotHeaders(httpReq.Header)
 
 	client, err := clientFor(opts)
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	start := time.Now()
 	resp, err := client.HTTP().Do(httpReq)
 	latency := time.Since(start)
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	limited := io.LimitReader(resp.Body, 4<<20) // 4MB cap, same discipline as mcp.Session.Do
 	respBody, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 
 	return &probe.RawResult{
@@ -342,7 +329,11 @@ func doFingerprintRequest(ctx context.Context, url string, req FPRequest, opts D
 		Headers:    resp.Header,
 		Body:       respBody,
 		Latency:    latency,
-	}, method, sentBody, nil
+		ReqMethod:  method,
+		ReqURL:     url,
+		ReqHeaders: reqHeaders,
+		ReqBody:    sentBody,
+	}, nil
 }
 
 // clientFor returns the shared HTTP client, falling back to a config-only one
