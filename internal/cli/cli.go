@@ -384,7 +384,7 @@ func Run(args []string, stdout, stderr *os.File) int {
 	opts.client = client
 
 	reg := probe.NewRegistry()
-	for _, p := range mcp.BuiltinProbes() {
+	for _, p := range mcp.BuiltinProbes(opts.client) {
 		reg.Register(p)
 	}
 	// Protocol-neutral transport checks, registered with Protocol() == "*" so
